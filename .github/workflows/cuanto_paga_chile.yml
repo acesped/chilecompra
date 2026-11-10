@@ -4,8 +4,7 @@ name: Cuanto Paga Chile - Solo Instagram
 on:
   workflow_dispatch:
   schedule:
-    # 13:20 UTC: 10:20 Chile en verano;
-    # 09:20 en invierno
+    # 13:20 UTC (10:20 Chile en verano; 09:20 en invierno)
     - cron: '20 13 * * *'
 
 permissions:
@@ -29,15 +28,12 @@ jobs:
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       ANIO: '2026'
       CASOS_POR_EJECUCION: '1'
       MAX_MB_DESCARGA: '45'
       MAX_REGISTROS: '15000'
-
       PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED || 'false' }}
       GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
-
       META_GRAPH_VERSION: 'v25.0'
       IG_USER_ID: ${{ secrets.IG_USER_ID }}
       INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
@@ -52,13 +48,19 @@ jobs:
           python-version: '3.12'
 
       - name: Instalar dependencias
-        run: |
-          python -m pip install --disable-pip-version-check \
-            'requests>=2.32,<3' \
-            'Pillow>=10,<13'
+        run: python -m pip install --disable-pip-version-check 'requests>=2.32,<3' 'Pillow>=10,<13'
 
       - name: Generar foto y pie con datos abiertos reales
         run: python cuanto_paga_chile.py generate
+
+      - name: Guardar vista previa para diagnóstico
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuanto-paga-chile-preview
+          path: ${{ runner.temp }}/cuanto_paga_chile/site
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Configurar GitHub Pages
         uses: actions/configure-pages@v5
@@ -72,5 +74,5 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Publicar solo en Instagram
+      - name: Publicar solo en Instagram (o previsualizar)
         run: python cuanto_paga_chile.py publish
