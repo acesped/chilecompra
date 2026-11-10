@@ -24,7 +24,6 @@ jobs:
   publicar:
     name: Generar y publicar en Instagram
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
 
     environment:
@@ -32,6 +31,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     env:
+      # GitHub
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Datos de compras públicas
@@ -40,10 +40,10 @@ jobs:
       MAX_MB_DESCARGA: "45"
       MAX_REGISTROS: "15000"
 
-      # Activación de publicación
+      # Control de publicación
       PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED || 'false' }}
 
-      # URL opcional de GitHub Pages
+      # GitHub Pages
       GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
 
       # Instagram API
@@ -53,42 +53,51 @@ jobs:
 
     steps:
 
-      # ===================================
+      # =====================================
       # 1. Descargar repositorio
-      # ===================================
+      # =====================================
 
       - name: Descargar proyecto
         uses: actions/checkout@v4
 
-      # ===================================
-      # 2. Preparar Python
-      # ===================================
+      # =====================================
+      # 2. Configurar Python SIN CACHE
+      # =====================================
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: ""
 
-      # ===================================
+      # =====================================
       # 3. Instalar dependencias
-      # ===================================
+      # =====================================
 
       - name: Instalar librerias
         run: |
           python -m pip install --upgrade pip
-          pip install requests Pillow
+          python -m pip install \
+            "requests>=2.32,<3" \
+            "Pillow>=10,<13"
 
-      # ===================================
-      # 4. Comprobar archivos y secretos
-      # ===================================
+      # =====================================
+      # 4. Validar archivo Python
+      # =====================================
 
-      - name: Verificar script
+      - name: Verificar script Python
         run: |
-          test -f cuanto_paga_chile.py
+          if [ ! -f cuanto_paga_chile.py ]; then
+            echo "::error::No existe cuanto_paga_chile.py"
+            exit 1
+          fi
+
           python -m py_compile cuanto_paga_chile.py
-          echo "Script Python encontrado y validado"
+
+          echo "Script Python validado correctamente"
+
+      # =====================================
+      # 5. Verificar credenciales
+      # =====================================
 
       - name: Comprobar credenciales Instagram
         if: env.PUBLISH_ENABLED == 'true'
@@ -103,13 +112,13 @@ jobs:
             exit 1
           fi
 
-          echo "Credenciales configuradas"
+          echo "Credenciales de Instagram configuradas"
 
-      # ===================================
-      # 5. Comprobar GitHub Pages
-      # ===================================
+      # =====================================
+      # 6. Verificar GitHub Pages
+      # =====================================
 
-      - name: Comprobar activacion de GitHub Pages
+      - name: Verificar GitHub Pages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -119,26 +128,27 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pages" \
             --silent; then
 
-            echo "::error::GitHub Pages no esta activado o no es accesible."
-            echo "::error::Abre Settings > Pages > Source y selecciona GitHub Actions."
+            echo "::error::GitHub Pages no esta habilitado."
+            echo "::error::Entra a Settings > Pages."
+            echo "::error::Selecciona GitHub Actions como Source."
             exit 1
           fi
 
           echo "GitHub Pages disponible"
 
-      # ===================================
-      # 6. Generar publicaciones
-      # ===================================
+      # =====================================
+      # 7. Generar publicaciones
+      # =====================================
 
       - name: Analizar compras publicas
         run: |
           python cuanto_paga_chile.py generate
 
-      # ===================================
-      # 7. Guardar vista previa
-      # ===================================
+      # =====================================
+      # 8. Guardar vista previa
+      # =====================================
 
-      - name: Guardar imagenes para revision
+      - name: Guardar imagenes generadas
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -147,49 +157,57 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # ===================================
-      # 8. Configurar Pages
-      # ===================================
+      # =====================================
+      # 9. Configurar GitHub Pages
+      # =====================================
 
       - name: Configurar GitHub Pages
         uses: actions/configure-pages@v5
 
-      # ===================================
-      # 9. Subir las imagenes
-      # ===================================
+      # =====================================
+      # 10. Subir imagenes a GitHub Pages
+      # =====================================
 
       - name: Preparar imagenes publicas
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/cuanto_paga_chile/site
 
-      # ===================================
-      # 10. Desplegar Pages
-      # ===================================
+      # =====================================
+      # 11. Publicar imagenes en Pages
+      # =====================================
 
       - name: Publicar imagenes en GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
-      # ===================================
-      # 11. Publicar Instagram
-      # ===================================
+      # =====================================
+      # 12. Publicar en Instagram
+      # =====================================
 
-      - name: Publicar o previsualizar Instagram
+      - name: Publicar en Instagram
         run: |
           python cuanto_paga_chile.py publish
 
-      # ===================================
-      # 12. Resumen
-      # ===================================
+      # =====================================
+      # 13. Resumen de ejecucion
+      # =====================================
 
       - name: Resumen de ejecucion
         if: always()
         run: |
           echo "## Cuanto Paga Chile" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Fecha UTC: $(date -u)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Fecha UTC: $(date -u)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Publicacion habilitada: $PUBLISH_ENABLED" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Publicacion habilitada: $PUBLISH_ENABLED" \
+            >> "$GITHUB_STEP_SUMMARY"
+
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Repositorio: $GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Repositorio: $GITHUB_REPOSITORY" \
+            >> "$GITHUB_STEP_SUMMARY"
