@@ -1,0 +1,77 @@
+
+name: Cuanto Paga Chile - Instagram y Fanpage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 13:20 UTC (10:20 Chile en horario de verano;
+    # 09:20 en invierno).
+    - cron: '20 13 * * *'
+
+permissions:
+  contents: read
+  issues: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: cuanto-paga-chile
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      ANIO: '2026'
+      CASOS_POR_EJECUCION: '1'
+      MAX_MB_DESCARGA: '45'
+      MAX_REGISTROS: '15000'
+
+      PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED || 'false' }}
+      GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
+
+      META_GRAPH_VERSION: 'v25.0'
+      FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      META_PAGE_ACCESS_TOKEN: ${{ secrets.META_PAGE_ACCESS_TOKEN }}
+
+    steps:
+      - name: Obtener los archivos del proyecto
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --disable-pip-version-check \
+            'requests>=2.32,<3' \
+            'Pillow>=10,<13'
+
+      - name: Generar imagen y pie con datos reales
+        run: python cuanto_paga_chile.py generate
+
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Preparar contenido para GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/cuanto_paga_chile/site
+
+      - name: Publicar imagenes en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Publicar en Facebook e Instagram
+        run: python cuanto_paga_chile.py publish
