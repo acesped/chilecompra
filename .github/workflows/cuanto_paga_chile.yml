@@ -1,19 +1,17 @@
-name: Cuanto Paga Chile - Instagram
+
+name: Cuanto Paga Chile - Instagram (metodo Sismonauta)
 
 on:
   workflow_dispatch:
-
   schedule:
-    # 13:20 UTC
-    # 10:20 Chile en verano
-    # 09:20 Chile en invierno
-    - cron: "20 13 * * *"
+    # 13:20 UTC: 10:20 Chile en verano / 09:20 en invierno
+    - cron: '20 13 * * *'
 
+# La rama instagram-media guarda las imágenes; main conserva solo el py + yml.
+# El histórico y las publicaciones inciertas quedan en un GitHub Issue.
 permissions:
-  contents: read
+  contents: write
   issues: write
-  pages: write
-  id-token: write
 
 concurrency:
   group: cuanto-paga-chile-instagram
@@ -21,129 +19,70 @@ concurrency:
 
 jobs:
   publicar:
-    name: Generar y publicar en Instagram
+    name: Analizar adjudicaciones y publicar en Instagram
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
     env:
-      # GitHub
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANIO: '2026'
+      CASOS_POR_EJECUCION: '1'
+      MAX_MB_DESCARGA: '45'
+      MAX_REGISTROS: '15000'
 
-      # Datos de compras públicas
-      ANIO: "2026"
-      CASOS_POR_EJECUCION: "1"
-      MAX_MB_DESCARGA: "45"
-      MAX_REGISTROS: "15000"
+      # Publicación real activada.
+      PUBLISH_ENABLED: 'true'
 
-      # PUBLICACIÓN ACTIVADA
-      PUBLISH_ENABLED: "true"
+      # Se alojan imágenes JPG permanentes en una rama separada.
+      IG_MEDIA_BRANCH: 'instagram-media'
+      IG_GRAPH_BASE: 'https://graph.instagram.com'
+      META_GRAPH_VERSION: 'v25.0'
 
-      # GitHub Pages
-      GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
-
-      # Instagram API
-      META_GRAPH_VERSION: "v25.0"
+      # Mismos GitHub Secrets de Cuánto Paga Chile (sin Facebook).
       IG_USER_ID: ${{ secrets.IG_USER_ID }}
       INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+      # Opcional: variable con el @usuario esperado para mayor seguridad.
+      IG_EXPECTED_USERNAME: ${{ vars.IG_EXPECTED_USERNAME }}
 
     steps:
       - name: Descargar proyecto
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Configurar Python (sin cache)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
-      - name: Instalar librerias
+      - name: Instalar dependencias
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install \
-            "requests>=2.32,<3" \
-            "Pillow>=10,<13"
+          python -m pip install --disable-pip-version-check \
+            'requests>=2.32,<3' 'Pillow>=10,<13'
 
-      - name: Verificar script Python
-        run: |
-          if [ ! -f cuanto_paga_chile.py ]; then
-            echo "::error::No existe cuanto_paga_chile.py"
-            exit 1
-          fi
+      - name: Verificar sintaxis del script
+        run: python -m py_compile cuanto_paga_chile.py
 
-          python -m py_compile cuanto_paga_chile.py
-          echo "Script Python validado correctamente"
+      - name: Verificar token e identidad de Instagram ANTES de generar
+        run: python cuanto_paga_chile.py check-instagram
 
-      - name: Comprobar credenciales Instagram
-        run: |
-          if [ -z "$IG_USER_ID" ]; then
-            echo "::error::Falta IG_USER_ID"
-            exit 1
-          fi
+      - name: Generar publicación desde adjudicaciones reales
+        run: python cuanto_paga_chile.py generate
 
-          if [ -z "$INSTAGRAM_ACCESS_TOKEN" ]; then
-            echo "::error::Falta INSTAGRAM_ACCESS_TOKEN"
-            exit 1
-          fi
-
-          echo "Credenciales de Instagram configuradas"
-
-      - name: Verificar GitHub Pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Comprobando GitHub Pages..."
-
-          if ! gh api \
-            "repos/${GITHUB_REPOSITORY}/pages" \
-            --silent; then
-
-            echo "::error::GitHub Pages no esta habilitado."
-            echo "::error::Entra a Settings > Pages."
-            echo "::error::Selecciona GitHub Actions como Source."
-            exit 1
-          fi
-
-          echo "GitHub Pages disponible"
-
-      - name: Analizar compras publicas
-        run: |
-          python cuanto_paga_chile.py generate
-
-      - name: Guardar imagenes generadas
+      - name: Guardar imagen y respaldo de auditoria
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cuanto-paga-chile-preview
-          path: ${{ runner.temp }}/cuanto_paga_chile/site/
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/cuanto_paga_chile/
           retention-days: 7
+          if-no-files-found: ignore
 
-      - name: Configurar GitHub Pages
-        uses: actions/configure-pages@v5
+      - name: Publicar fotografía solo en Instagram
+        run: python cuanto_paga_chile.py publish
 
-      - name: Preparar imagenes publicas
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ${{ runner.temp }}/cuanto_paga_chile/site
-
-      - name: Publicar imagenes en GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Publicar en Instagram
-        run: |
-          python cuanto_paga_chile.py publish
-
-      - name: Resumen de ejecucion
+      - name: Resumen
         if: always()
         run: |
-          echo "## Cuanto Paga Chile" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Fecha UTC: $(date -u)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Publicacion habilitada: $PUBLISH_ENABLED" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '## Cuánto Paga Chile — Instagram' >> "$GITHUB_STEP_SUMMARY"
+          echo "Publicación habilitada: $PUBLISH_ENABLED" >> "$GITHUB_STEP_SUMMARY"
           echo "Repositorio: $GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rama de imágenes: $IG_MEDIA_BRANCH" >> "$GITHUB_STEP_SUMMARY"
