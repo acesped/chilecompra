@@ -1,11 +1,11 @@
 
-name: Cuanto Paga Chile - Instagram y Fanpage
+name: Cuanto Paga Chile - Solo Instagram
 
 on:
   workflow_dispatch:
   schedule:
-    # 13:20 UTC (10:20 Chile en horario de verano;
-    # 09:20 en invierno).
+    # 13:20 UTC: 10:20 Chile en verano;
+    # 09:20 en invierno
     - cron: '20 13 * * *'
 
 permissions:
@@ -15,7 +15,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: cuanto-paga-chile
+  group: cuanto-paga-chile-instagram
   cancel-in-progress: false
 
 jobs:
@@ -39,12 +39,11 @@ jobs:
       GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
 
       META_GRAPH_VERSION: 'v25.0'
-      FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
       IG_USER_ID: ${{ secrets.IG_USER_ID }}
-      META_PAGE_ACCESS_TOKEN: ${{ secrets.META_PAGE_ACCESS_TOKEN }}
+      INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
 
     steps:
-      - name: Obtener los archivos del proyecto
+      - name: Obtener archivos
         uses: actions/checkout@v4
 
       - name: Instalar Python
@@ -58,20 +57,20 @@ jobs:
             'requests>=2.32,<3' \
             'Pillow>=10,<13'
 
-      - name: Generar imagen y pie con datos reales
+      - name: Generar foto y pie con datos abiertos reales
         run: python cuanto_paga_chile.py generate
 
       - name: Configurar GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Preparar contenido para GitHub Pages
+      - name: Subir imágenes para Instagram
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/cuanto_paga_chile/site
 
-      - name: Publicar imagenes en GitHub Pages
+      - name: Desplegar imágenes públicas
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Publicar en Facebook e Instagram
+      - name: Publicar solo en Instagram
         run: python cuanto_paga_chile.py publish
