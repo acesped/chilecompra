@@ -1,4 +1,3 @@
-
 name: Cuanto Paga Chile - Instagram
 
 on:
@@ -40,8 +39,8 @@ jobs:
       MAX_MB_DESCARGA: "45"
       MAX_REGISTROS: "15000"
 
-      # Control de publicación
-      PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED || 'false' }}
+      # PUBLICACIÓN ACTIVADA
+      PUBLISH_ENABLED: "true"
 
       # GitHub Pages
       GH_PAGES_BASE_URL: ${{ vars.GH_PAGES_BASE_URL }}
@@ -52,26 +51,13 @@ jobs:
       INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
 
     steps:
-
-      # =====================================
-      # 1. Descargar repositorio
-      # =====================================
-
       - name: Descargar proyecto
         uses: actions/checkout@v4
-
-      # =====================================
-      # 2. Configurar Python SIN CACHE
-      # =====================================
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      # =====================================
-      # 3. Instalar dependencias
-      # =====================================
 
       - name: Instalar librerias
         run: |
@@ -79,10 +65,6 @@ jobs:
           python -m pip install \
             "requests>=2.32,<3" \
             "Pillow>=10,<13"
-
-      # =====================================
-      # 4. Validar archivo Python
-      # =====================================
 
       - name: Verificar script Python
         run: |
@@ -92,15 +74,9 @@ jobs:
           fi
 
           python -m py_compile cuanto_paga_chile.py
-
           echo "Script Python validado correctamente"
 
-      # =====================================
-      # 5. Verificar credenciales
-      # =====================================
-
       - name: Comprobar credenciales Instagram
-        if: env.PUBLISH_ENABLED == 'true'
         run: |
           if [ -z "$IG_USER_ID" ]; then
             echo "::error::Falta IG_USER_ID"
@@ -113,10 +89,6 @@ jobs:
           fi
 
           echo "Credenciales de Instagram configuradas"
-
-      # =====================================
-      # 6. Verificar GitHub Pages
-      # =====================================
 
       - name: Verificar GitHub Pages
         env:
@@ -136,17 +108,9 @@ jobs:
 
           echo "GitHub Pages disponible"
 
-      # =====================================
-      # 7. Generar publicaciones
-      # =====================================
-
       - name: Analizar compras publicas
         run: |
           python cuanto_paga_chile.py generate
-
-      # =====================================
-      # 8. Guardar vista previa
-      # =====================================
 
       - name: Guardar imagenes generadas
         if: always()
@@ -157,57 +121,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # =====================================
-      # 9. Configurar GitHub Pages
-      # =====================================
-
       - name: Configurar GitHub Pages
         uses: actions/configure-pages@v5
-
-      # =====================================
-      # 10. Subir imagenes a GitHub Pages
-      # =====================================
 
       - name: Preparar imagenes publicas
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/cuanto_paga_chile/site
 
-      # =====================================
-      # 11. Publicar imagenes en Pages
-      # =====================================
-
       - name: Publicar imagenes en GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
-      # =====================================
-      # 12. Publicar en Instagram
-      # =====================================
-
       - name: Publicar en Instagram
         run: |
           python cuanto_paga_chile.py publish
-
-      # =====================================
-      # 13. Resumen de ejecucion
-      # =====================================
 
       - name: Resumen de ejecucion
         if: always()
         run: |
           echo "## Cuanto Paga Chile" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Fecha UTC: $(date -u)" \
-            >> "$GITHUB_STEP_SUMMARY"
-
+          echo "Fecha UTC: $(date -u)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Publicacion habilitada: $PUBLISH_ENABLED" \
-            >> "$GITHUB_STEP_SUMMARY"
-
+          echo "Publicacion habilitada: $PUBLISH_ENABLED" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Repositorio: $GITHUB_REPOSITORY" \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo "Repositorio: $GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
