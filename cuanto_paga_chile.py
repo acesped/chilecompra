@@ -2008,17 +2008,16 @@ def crear_caption(
     texto = (
         "=== CUANTO PAGA CHILE? === 🔎 "
         "¿Qué muestran los registros de esta "
-        "adjudicación pública? "
+        "adjudicación pública?/n "
 
         "En los datos abiertos de compras "
-        "públicas de Chile, publicados por "
-        "Open Contracting Partnership a partir "
+        "públicas de Chile a partir "
         "de información de ChileCompra, "
         f"encontramos el proceso {caso['ocid']}, "
         f"en el que figura {caso['comprador']} "
         "como organismo comprador y "
         f"{caso['proveedor']} como proveedor "
-        "adjudicado. "
+        "adjudicado./n "
 
         f"El artículo descrito como "
         f"«{caso['descripcion']}» registra "
@@ -2029,7 +2028,7 @@ def crear_caption(
     if fecha:
         texto += (
             f"La adjudicación está fechada "
-            f"el {fecha}. "
+            f"el {fecha}./n "
         )
 
     texto += (
@@ -2056,7 +2055,7 @@ def crear_caption(
             "Entre los antecedentes previos "
             "observados para el mismo artículo "
             "aparecen proveedores como "
-            f"{nombres}. "
+            f"{nombres}./n "
         )
 
     texto += (
