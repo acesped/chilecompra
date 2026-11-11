@@ -1,4 +1,4 @@
-name: CUANTO GANA CHILE - Monitor diario y renovacion preventiva Instagram
+name: CUANTO PAGA CHILE - Monitor diario y renovacion preventiva Instagram
 
 # Comprobacion diaria; el Python decide si han transcurrido 7 dias.
 # No soluciona revocaciones de Meta (OAuth 190).
@@ -16,26 +16,26 @@ on:
         required: false
         default: false
   schedule:
-    - cron: '31 9 * * *'
+    - cron: '37 9 * * *'
 
 permissions:
   contents: read
 
-# Grupo propio de @cuanto_gana_chile. Usar el mismo grupo en
+# Grupo propio de @cuantopagachile. Usar el mismo grupo en
 # cualquier otro workflow que modifique este mismo secreto.
 concurrency:
-  group: cuanto-gana-chile-instagram-token
+  group: cuantopagachile-instagram-token
   cancel-in-progress: false
 
 jobs:
   monitor-token:
-    name: Comprobar y renovar token de @cuanto_gana_chile
+    name: Comprobar y renovar token de @cuantopagachile
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     env:
       PYTHONUNBUFFERED: '1'
       IG_LOGIN_TYPE: instagram
-      IG_EXPECTED_USERNAME: cuanto_gana_chile
+      IG_EXPECTED_USERNAME: cuantopagachile
       GITHUB_REPOSITORY: ${{ github.repository }}
       INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
       IG_USER_ID: ${{ secrets.IG_USER_ID }}
@@ -49,13 +49,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo 'CUANTO GANA CHILE | Monitor del token Instagram'
+          echo 'CUANTO PAGA CHILE | Monitor del token Instagram'
           echo "Repositorio: $GITHUB_REPOSITORY"
           echo "Evento: $GITHUB_EVENT_NAME"
           echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "Comprobacion sin escritura: $CHECK_ONLY"
           echo "Forzar renovacion: $FORCE_REFRESH"
-          echo "Publicaciones habilitadas: ${PUBLISH_ENABLED:-no configurado}"
           if [[ "$CHECK_ONLY" == 'true' && "$FORCE_REFRESH" == 'true' ]]; then
             echo '::warning::Ambas opciones activadas: prevalece solo_verificar; no se renovara ni escribira el secreto.'
             echo 'FORCE_REFRESH=false' >> "$GITHUB_ENV"
@@ -89,6 +88,10 @@ jobs:
             exit 1
           }
           python -m py_compile scripts/refresh_instagram_token.py
+          if [[ "$GITHUB_REPOSITORY" != 'acesped/chilecompra' ]]; then
+            echo '::error::Repositorio no autorizado para este renovador'
+            exit 1
+          fi
           for name in INSTAGRAM_ACCESS_TOKEN IG_USER_ID; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Falta GitHub Secret: $name"
@@ -108,8 +111,8 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           source=Path('scripts/refresh_instagram_token.py').read_text(encoding='utf-8')
-          if "SECRET_NAME = 'INSTAGRAM_ACCESS_TOKEN'" not in source or "cuanto_gana_chile" not in source:
-              raise SystemExit('::error::Instala el renovador Python especifico de @cuanto_gana_chile y INSTAGRAM_ACCESS_TOKEN')
+          if "SECRET_NAME = 'INSTAGRAM_ACCESS_TOKEN'" not in source or "username != 'cuantopagachile'" not in source or "need('IG_USER_ID')" not in source:
+              raise SystemExit('::error::Instala el renovador Python especifico de @cuantopagachile y INSTAGRAM_ACCESS_TOKEN')
           PY
 
       - name: Verificar permiso de GitHub Secrets
@@ -172,19 +175,18 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo '## CUANTO GANA CHILE - Token de Instagram'
+            echo '## CUANTO PAGA CHILE - Token de Instagram'
             echo ''
-            echo '- Cuenta esperada: @cuanto_gana_chile'
+            echo '- Cuenta esperada: @cuantopagachile'
             echo "- Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
             echo "- Comprobacion solamente: ${CHECK_ONLY:-false}"
             echo "- Renovacion forzada: ${FORCE_REFRESH:-false}"
-            echo "- Publicaciones habilitadas: ${PUBLISH_ENABLED:-no configurado}"
             echo "- Resultado del paso: ${REFRESH_RESULT:-no ejecutado}"
             echo ''
             if [[ "$REFRESH_RESULT" != 'success' ]]; then
               echo '### Accion requerida'
               echo 'Comprobar el error del paso de renovacion. Si Meta informa OAuth 190,'
-              echo 'se requiere reautorizar @cuanto_gana_chile; el refresh no recupera tokens revocados.'
+              echo 'se requiere reautorizar @cuantopagachile; el refresh no recupera tokens revocados.'
               echo 'Si GitHub deniega la escritura, revisar el permiso Secrets: Read and write de GH_SECRETS_TOKEN.'
               echo ''
               echo '> Nunca incluir tokens en logs, artefactos o commits.'
