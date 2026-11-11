@@ -1,0 +1,189 @@
+name: CUANTO PAGA CHILE - Monitor diario y renovacion preventiva Instagram
+
+# Comprobacion diaria; el Python decide si han transcurrido 7 dias.
+# No soluciona revocaciones de Meta (OAuth 190).
+on:
+  workflow_dispatch:
+    inputs:
+      forzar_renovacion:
+        description: 'Solicitar renovacion antes de 7 dias (solo token valido y elegible)'
+        type: boolean
+        required: false
+        default: false
+      solo_verificar:
+        description: 'Comprobar identidad y validez, sin modificar Secrets'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '23 9 * * *'
+
+permissions:
+  contents: read
+
+# Grupo propio de @cuanto_paga_chile. Usar el mismo grupo en
+# cualquier otro workflow que modifique este mismo secreto.
+concurrency:
+  group: cuanto-paga-chile-instagram-token
+  cancel-in-progress: false
+
+jobs:
+  monitor-token:
+    name: Comprobar y renovar token de @cuanto_paga_chile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      PYTHONUNBUFFERED: '1'
+      IG_LOGIN_TYPE: instagram
+      IG_EXPECTED_USERNAME: cuanto_paga_chile
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+      INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+      GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+      FORCE_REFRESH: ${{ inputs.forzar_renovacion || false }}
+      CHECK_ONLY: ${{ inputs.solo_verificar || false }}
+
+    steps:
+      - name: Identificar ejecucion
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'CUANTO PAGA CHILE | Monitor del token Instagram'
+          echo "Repositorio: $GITHUB_REPOSITORY"
+          echo "Evento: $GITHUB_EVENT_NAME"
+          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "Comprobacion sin escritura: $CHECK_ONLY"
+          echo "Forzar renovacion: $FORCE_REFRESH"
+          if [[ "$CHECK_ONLY" == 'true' && "$FORCE_REFRESH" == 'true' ]]; then
+            echo '::error::solo_verificar y forzar_renovacion son incompatibles'
+            exit 1
+          fi
+
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --retries 3 \
+            'requests>=2.31,<3' 'PyNaCl>=1.5,<2'
+
+      - name: Verificar script y secretos
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f scripts/refresh_instagram_token.py || {
+            echo '::error::Falta scripts/refresh_instagram_token.py'
+            exit 1
+          }
+          python -m py_compile scripts/refresh_instagram_token.py
+          for name in INSTAGRAM_ACCESS_TOKEN INSTAGRAM_USER_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Falta GitHub Secret: $name"
+              exit 1
+            fi
+          done
+          if [[ ! "$INSTAGRAM_USER_ID" =~ ^[0-9]+$ ]]; then
+            echo '::error::INSTAGRAM_USER_ID debe ser numerico'
+            exit 1
+          fi
+          if [[ "$CHECK_ONLY" != 'true' && -z "${GH_SECRETS_TOKEN:-}" ]]; then
+            echo '::error::Falta GH_SECRETS_TOKEN para actualizar Instagram Secret'
+            exit 1
+          fi
+          # El valor del token nunca se imprime.
+          echo 'Script y configuracion basica verificados'
+          python - <<'PY'
+          from pathlib import Path
+          source=Path('scripts/refresh_instagram_token.py').read_text(encoding='utf-8')
+          if "SECRET_NAME = 'INSTAGRAM_ACCESS_TOKEN'" not in source or "cuanto_paga_chile" not in source:
+              raise SystemExit('::error::Instala el renovador Python especifico de @cuanto_paga_chile y INSTAGRAM_ACCESS_TOKEN')
+          PY
+
+      - name: Verificar permiso de GitHub Secrets
+        if: ${{ inputs.solo_verificar != true }}
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import requests
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_SECRETS_TOKEN']
+          headers = {
+              'Authorization': 'Bearer ' + token,
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+          for path in (
+              '/actions/secrets/INSTAGRAM_ACCESS_TOKEN',
+              '/actions/secrets/public-key',
+          ):
+              url = f'https://api.github.com/repos/{repo}{path}'
+              try:
+                  response = requests.get(url, headers=headers, timeout=20)
+              except requests.RequestException as exc:
+                  raise SystemExit('::error::GitHub Secrets: fallo de conexion (' + type(exc).__name__ + ')')
+              if response.status_code != 200:
+                  raise SystemExit(
+                      f'::error::GitHub Secrets: GET {path} devolvio HTTP '
+                      f'{response.status_code}. Revisar permisos Secrets Read/Write '
+                      'y acceso al repositorio.'
+                  )
+          print('GitHub Secrets: lectura de metadata y clave publica confirmadas')
+          print('Nota: el permiso de escritura se comprueba al guardar el token nuevo')
+          PY
+
+      - name: Verificar identidad y renovar cuando corresponda
+        id: refresh
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$FORCE_REFRESH" == 'true' ]]; then args+=(--force-refresh); fi
+          if [[ "$CHECK_ONLY" == 'true' ]]; then args+=(--check-only); fi
+          # Mantener el codigo de salida del script sin imprimir credenciales.
+          python scripts/refresh_instagram_token.py "${args[@]}"
+          echo 'Comprobacion de Meta finalizada correctamente'
+
+      - name: Resumen y accion correctiva
+        if: always()
+        shell: bash
+        env:
+          REFRESH_RESULT: ${{ steps.refresh.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## CUANTO PAGA CHILE - Token de Instagram'
+            echo ''
+            echo '- Cuenta esperada: @cuanto_paga_chile'
+            echo "- Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "- Comprobacion solamente: ${CHECK_ONLY:-false}"
+            echo "- Renovacion forzada: ${FORCE_REFRESH:-false}"
+            echo "- Resultado del paso: ${REFRESH_RESULT:-no ejecutado}"
+            echo ''
+            if [[ "$REFRESH_RESULT" != 'success' ]]; then
+              echo '### Accion requerida'
+              echo 'Comprobar el error del paso de renovacion. Si Meta informa OAuth 190,'
+              echo 'se requiere reautorizar @cuanto_paga_chile; el refresh no recupera tokens revocados.'
+              echo 'Si GitHub deniega la escritura, revisar el permiso Secrets: Read and write de GH_SECRETS_TOKEN.'
+              echo ''
+              echo '> Nunca incluir tokens en logs, artefactos o commits.'
+            else
+              echo 'Comprobacion exitosa. El paso de Python indica si correspondia renovar;'
+              echo 'el monitor no afirma que hubo renovacion cuando solo se verifico la cuenta.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
