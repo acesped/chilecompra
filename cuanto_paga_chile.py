@@ -1,2685 +1,918 @@
 
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# CUANTO PAGA CHILE? - GitHub Actions + Instagram API con Instagram Login
+# Sin ticket de ChileCompra ni IA: datos abiertos OCDS publicados por OCP.
+# Publica solo diferencias estadisticas entre adjudicaciones del archivo parcial,
+# NO compara con precios actuales de mercado.
 
-"""
-CUANTO PAGA CHILE?
-Datos abiertos OCDS de ChileCompra vía Open Contracting Partnership.
-
-Publicación exclusivamente en Instagram mediante Instagram Login.
-Imágenes alojadas en una rama pública independiente de GitHub.
-Historial persistente en GitHub Issues.
-
-Dependencias:
-    pip install requests Pillow
-
-Comandos:
-    python cuanto_paga_chile.py check-instagram
-    python cuanto_paga_chile.py generate
-    python cuanto_paga_chile.py publish
-"""
-
-import os
-import re
-import json
-import zlib
-import math
-import time
-import base64
-import random
-import hashlib
-import argparse
-import statistics
-import unicodedata
-
+import os, re, sys, json, zlib, math, random, time, zipfile, hashlib, statistics, argparse, subprocess, base64
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
-
+from urllib.parse import quote
 import requests
-from PIL import Image, ImageDraw, ImageFont
-
-
-# ==========================================
-# CONFIGURACION
-# ==========================================
-
-TZ = ZoneInfo("America/Santiago")
-
-ANIO = int(
-    os.getenv(
-        "ANIO",
-        str(datetime.now(TZ).year)
-    )
-)
-
-MAX_MB_DESCARGA = int(
-    os.getenv("MAX_MB_DESCARGA", "45")
-)
-
-MAX_REGISTROS = int(
-    os.getenv("MAX_REGISTROS", "15000")
-)
-
-CASOS_POR_EJECUCION = int(
-    os.getenv("CASOS_POR_EJECUCION", "1")
-)
-
-PUBLISH_ENABLED = (
-    os.getenv("PUBLISH_ENABLED", "false").lower()
-    == "true"
-)
-
-GRAPH_VERSION = os.getenv(
-    "META_GRAPH_VERSION",
-    "v25.0"
-)
-
-IG_GRAPH_BASE = os.getenv(
-    "IG_GRAPH_BASE",
-    "https://graph.instagram.com"
-).rstrip("/")
-
-GRAPH = f"{IG_GRAPH_BASE}/{GRAPH_VERSION}"
-
-IG_EXPECTED_USERNAME = os.getenv(
-    "IG_EXPECTED_USERNAME",
-    "cuantopagachile"
-).strip().lower().lstrip("@")
-
-MEDIA_BRANCH = os.getenv(
-    "IG_MEDIA_BRANCH",
-    "instagram-media"
-)
-
-MEDIA_PATH = "cuanto_paga_chile/imagenes"
-
-ISSUE_TITLE = (
-    "[BOT] Estado de publicaciones Cuánto Paga Chile"
-)
-
-OCP_URL = (
-    "https://data.open-contracting.org/"
-    "es/publication/144"
-)
-
-URLS = [
-    (
-        f"https://data.open-contracting.org/"
-        f"es/publication/144/download?"
-        f"name={ANIO}.jsonl.gz"
-    ),
-    (
-        "https://fastly.data.open-contracting.org/"
-        "downloads/chile_compra_api_releases/"
-        f"3730/{ANIO}.jsonl.gz"
-    ),
-]
-
-CARPETA = (
-    Path(os.getenv("RUNNER_TEMP", "/tmp"))
-    / "cuanto_paga_chile"
-)
-
-MEDIA = CARPETA / "site" / "media"
-
-MEDIA.mkdir(parents=True, exist_ok=True)
-
-(CARPETA / "site" / "index.html").write_text(
-    "<!doctype html><html lang='es'>"
-    "<meta charset='utf-8'>"
-    "<title>Cuánto Paga Chile</title>",
-    encoding="utf-8"
-)
-
-ISSUE_NUMBER = None
-STATE = None
-
-
-# ==========================================
-# UTILIDADES
-# ==========================================
-
-def log(*partes):
-    print(*partes, flush=True)
-
-
-def normalizar(texto):
-    texto = unicodedata.normalize(
-        "NFKD",
-        str(texto).lower()
-    )
-
-    texto = "".join(
-        c for c in texto
-        if not unicodedata.combining(c)
-    )
-
-    texto = re.sub(
-        r"[^a-z0-9 ]",
-        " ",
-        texto
-    )
-
-    return re.sub(
-        r"\s+",
-        " ",
-        texto
-    ).strip()
-
-
-def numero(valor):
-    if isinstance(valor, (int, float)):
-        resultado = float(valor)
-        return (
-            resultado
-            if math.isfinite(resultado)
-            else None
-        )
-
-    if isinstance(valor, str):
-        try:
-            texto = valor.strip().replace(" ", "")
-
-            if "," in texto and "." in texto:
-                texto = texto.replace(
-                    ".", ""
-                ).replace(",", ".")
-            elif "," in texto:
-                texto = texto.replace(",", ".")
-
-            resultado = float(texto)
-
-            return (
-                resultado
-                if math.isfinite(resultado)
-                else None
-            )
-
-        except ValueError:
-            pass
-
-    return None
-
-
-def dinero(valor):
-    return "$" + format(
-        round(valor),
-        ","
-    ).replace(",", ".")
-
-
-def fecha_legible(valor):
-    if not valor:
-        return None
-
-    try:
-        fecha = datetime.fromisoformat(
-            str(valor).replace("Z", "+00:00")
-        )
-
-        return fecha.strftime("%d-%m-%Y")
-
-    except (ValueError, TypeError):
-        return None
-
-
-def fecha_ordenable(valor):
-    if not valor:
-        return None
-
-    return str(valor)[:10]
-
-
-def fecha_consulta():
-    return datetime.now(TZ).strftime("%d-%m-%Y")
-
-
-def safe_error(exc):
-    """
-    Nunca mostrar secretos en los registros.
-    """
-
-    mensaje = str(exc)
-
-    for nombre in (
-        "GITHUB_TOKEN",
-        "INSTAGRAM_ACCESS_TOKEN",
-        "INSTAGRAM_TOKEN",
-    ):
-        secreto = os.getenv(nombre, "")
-
-        if secreto:
-            mensaje = mensaje.replace(
-                secreto,
-                "[REDACTADO]"
-            )
-
-    return mensaje[:350]
-
-
-def identificador(caso):
-    """
-    Compatible con los identificadores
-    utilizados por la versión anterior.
-    """
-
-    return (
-        f"{caso['ocid']}::"
-        f"{caso.get('award_id', '')}::"
-        f"{caso['clave']}"
-    )
-
-
-# ==========================================
-# GITHUB API
-# ==========================================
-
-def github_request(
-    metodo,
-    ruta,
-    datos=None
-):
-    token = os.getenv("GITHUB_TOKEN", "")
-    repo = os.getenv("GITHUB_REPOSITORY", "")
-
-    if not token or not repo:
-        raise RuntimeError(
-            "Faltan GITHUB_TOKEN "
-            "o GITHUB_REPOSITORY"
-        )
-
-    respuesta = requests.request(
-        metodo,
-        f"https://api.github.com/repos/{repo}{ruta}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        json=datos,
-        timeout=60,
-    )
-
-    if not respuesta.ok:
-        raise RuntimeError(
-            f"GitHub API HTTP "
-            f"{respuesta.status_code}: "
-            f"{respuesta.text[:250]}"
-        )
-
-    return (
-        respuesta.json()
-        if respuesta.content
-        else None
-    )
-
-
-# ==========================================
-# GITHUB ISSUES: HISTORIAL
-# ==========================================
-
-def state_load():
-    global ISSUE_NUMBER
-
-    issues = github_request(
-        "GET",
-        "/issues?state=all&per_page=100"
-    )
-
-    for issue in issues:
-        if (
-            issue.get("title") == ISSUE_TITLE
-            and "pull_request" not in issue
-        ):
-            ISSUE_NUMBER = issue["number"]
-
-            try:
-                estado = json.loads(
-                    issue.get("body") or "{}"
-                )
-
-            except ValueError:
-                raise RuntimeError(
-                    "El historial contiene JSON inválido"
-                )
-
-            return {
-                "history": estado.get(
-                    "history", []
-                ),
-                "pending": estado.get(
-                    "pending", []
-                ),
-                "abandoned": estado.get(
-                    "abandoned", []
-                ),
-                "uncertain": estado.get(
-                    "uncertain", []
-                ),
-            }
-
-    nuevo = github_request(
-        "POST",
-        "/issues",
-        {
-            "title": ISSUE_TITLE,
-            "body": json.dumps(
-                {
-                    "history": [],
-                    "pending": [],
-                    "abandoned": [],
-                    "uncertain": [],
-                },
-                ensure_ascii=False,
-                indent=2
-            ),
-        }
-    )
-
-    ISSUE_NUMBER = nuevo["number"]
-
-    return {
-        "history": [],
-        "pending": [],
-        "abandoned": [],
-        "uncertain": [],
-    }
-
-
-def state_save(estado):
-    if not ISSUE_NUMBER:
-        raise RuntimeError(
-            "El historial no está inicializado"
-        )
-
-    github_request(
-        "PATCH",
-        f"/issues/{ISSUE_NUMBER}",
-        {
-            "body": json.dumps(
-                estado,
-                ensure_ascii=False,
-                indent=2
-            )
-        }
-    )
-
-
-def init_state():
-    global STATE
-
-    if STATE is None:
-        STATE = state_load()
-
-    return STATE
-
-
-# ==========================================
-# CREDENCIALES INSTAGRAM
-# ==========================================
-
-def instagram_credentials():
-    """
-    Obtiene el token de Instagram Login.
-
-    Comprueba formato, pero nunca revela
-    ni imprime el token.
-    """
-
-    raw = os.getenv(
-        "INSTAGRAM_ACCESS_TOKEN"
-    )
-
-    if not raw:
-        raw = os.getenv(
-            "INSTAGRAM_TOKEN",
-            ""
-        )
-
-    user = (
-        os.getenv("IG_USER_ID")
-        or os.getenv("INSTAGRAM_USER_ID")
-        or ""
-    ).strip()
-
-    if not raw:
-        raise RuntimeError(
-            "INSTAGRAM_ACCESS_TOKEN está vacío "
-            "o no fue entregado por GitHub Actions"
-        )
-
-    if raw != raw.strip():
-        raise RuntimeError(
-            "INSTAGRAM_ACCESS_TOKEN contiene "
-            "espacios o saltos de línea "
-            "al inicio o al final"
-        )
-
-    token = raw.strip()
-
-    if token.lower().startswith("bearer "):
-        raise RuntimeError(
-            "El secreto no debe incluir "
-            "el prefijo Bearer"
-        )
-
-    if (
-        token.startswith(("'", '"'))
-        or token.endswith(("'", '"'))
-    ):
-        raise RuntimeError(
-            "El secreto contiene comillas. "
-            "Guarda únicamente el token."
-        )
-
-    if any(
-        caracter.isspace()
-        for caracter in token
-    ):
-        raise RuntimeError(
-            "El secreto contiene espacios "
-            "o saltos de línea internos"
-        )
-
-    if not user or not user.isdigit():
-        raise RuntimeError(
-            "IG_USER_ID debe contener "
-            "el ID numérico profesional "
-            "de Instagram"
-        )
-
-    log(
-        "INSTAGRAM:",
-        "secreto presente;",
-        "formato básico correcto;",
-        "ID numérico configurado."
-    )
-
-    return user, token
-
-
-# ==========================================
-# META GRAPH API
-# ==========================================
-
-def meta_request(
-    metodo,
-    ruta,
-    token,
-    datos=None,
-    timeout=75
-):
-    """
-    Método utilizado por SISMONAUTA:
-    el token se envía como access_token.
-
-    GET  -> params
-    POST -> form data
-    """
-
-    campos = {
-        **(datos or {}),
-        "access_token": token,
-    }
-
-    url = GRAPH + "/" + ruta.lstrip("/")
-
-    try:
-        if metodo == "GET":
-            respuesta = requests.get(
-                url,
-                params=campos,
-                timeout=timeout,
-            )
-        else:
-            respuesta = requests.post(
-                url,
-                data=campos,
-                timeout=timeout,
-            )
-
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            "No se pudo conectar con Instagram: "
-            + type(exc).__name__
-        ) from exc
-
-    try:
-        resultado = respuesta.json()
-
-    except ValueError:
-        raise RuntimeError(
-            "Instagram no devolvió una "
-            "respuesta JSON válida. "
-            f"HTTP {respuesta.status_code}"
-        )
-
-    if not respuesta.ok or resultado.get("error"):
-        error = resultado.get("error") or {}
-
-        codigo = error.get("code", "?")
-
-        mensaje = str(
-            error.get(
-                "message",
-                "Error no especificado"
-            )
-        )
-
-        mensaje = mensaje.replace(
-            token,
-            "[REDACTADO]"
-        )[:240]
-
-        if str(codigo) == "190":
-            raise RuntimeError(
-                "Instagram OAuth 190: "
-                + mensaje
-                + ". Meta rechazó el token. "
-                "Genera un token de Instagram Login "
-                "para @cuantopagachile, actualiza "
-                "INSTAGRAM_ACCESS_TOKEN en GitHub "
-                "Secrets y revisa si existe otro "
-                "secreto del mismo nombre en "
-                "GitHub Environments."
-            )
-
-        raise RuntimeError(
-            f"Instagram API HTTP "
-            f"{respuesta.status_code}, "
-            f"código {codigo}: {mensaje}"
-        )
-
-    return resultado
-
-
-# ==========================================
-# VERIFICAR INSTAGRAM
-# ==========================================
-
-def instagram_check():
-    """
-    Verifica autenticación e identidad
-    sin intentar publicar.
-
-    Compatible con los campos id/user_id
-    de Instagram Login.
-    """
-
-    user, token = instagram_credentials()
-
-    try:
-        info = meta_request(
-            "GET",
-            "me",
-            token,
-            {
-                "fields": "id,user_id,username"
-            }
-        )
-
-    except RuntimeError as exc:
-        mensaje = str(exc).lower()
-
-        if (
-            "user_id" not in mensaje
-            or "190" in mensaje
-        ):
-            raise
-
-        info = meta_request(
-            "GET",
-            "me",
-            token,
-            {
-                "fields": "id,username"
-            }
-        )
-
-    username = str(
-        info.get("username") or ""
-    ).strip().lower().lstrip("@")
-
-    if not username:
-        raise RuntimeError(
-            "Instagram respondió sin username. "
-            "Comprueba el permiso "
-            "instagram_business_basic."
-        )
-
-    if (
-        IG_EXPECTED_USERNAME
-        and username != IG_EXPECTED_USERNAME
-    ):
-        raise RuntimeError(
-            "El token corresponde a "
-            f"@{username}, no a "
-            f"@{IG_EXPECTED_USERNAME}"
-        )
-
-    ids_permitidos = {
-        str(info.get("id") or ""),
-        str(info.get("user_id") or ""),
-    }
-
-    if user not in ids_permitidos:
-        perfil = meta_request(
-            "GET",
-            user,
-            token,
-            {
-                "fields": "id,username"
-            }
-        )
-
-        perfil_id = str(
-            perfil.get("id") or ""
-        )
-
-        perfil_usuario = str(
-            perfil.get("username") or ""
-        ).strip().lower().lstrip("@")
-
-        if (
-            perfil_id != user
-            or perfil_usuario != username
-        ):
-            raise RuntimeError(
-                "IG_USER_ID no corresponde "
-                "a la cuenta autorizada "
-                "por este token"
-            )
-
-    log(
-        "INSTAGRAM CHECK OK:",
-        f"@{username}",
-        "| ID de publicación confirmado."
-    )
-
-    return user, token
-
-
-# ==========================================
-# ALOJAMIENTO DE IMAGENES EN GITHUB
-# ==========================================
-
-def media_url(nombre):
-    repo = os.getenv(
-        "GITHUB_REPOSITORY",
-        ""
-    )
-
-    if "/" not in repo:
-        raise RuntimeError(
-            "GITHUB_REPOSITORY no configurado"
-        )
-
-    return (
-        f"https://raw.githubusercontent.com/"
-        f"{repo}/"
-        f"{quote(MEDIA_BRANCH, safe='')}/"
-        f"{MEDIA_PATH}/"
-        f"{quote(nombre)}"
-    )
-
-
-def legacy_pages_url(nombre):
-    base = os.getenv(
-        "GH_PAGES_BASE_URL",
-        ""
-    ).rstrip("/")
-
+from PIL import Image, ImageFont, ImageDraw
+
+ROOT=Path(__file__).resolve().parent
+# Solo el archivo .py y el workflow .yml viven en el repositorio.
+# media/ es una carpeta TEMPORAL creada por GitHub Actions (no se confirma en git).
+CARPETA=Path(os.getenv('RUNNER_TEMP','/tmp'))/'cuanto_paga_chile'
+CARPETA.mkdir(parents=True,exist_ok=True)
+MEDIA=CARPETA/'site'/'media'
+MEDIA.mkdir(parents=True,exist_ok=True)
+(CARPETA/'site'/'index.html').write_text('<!doctype html><html lang="es"><meta charset="utf-8"><title>Cuánto Paga Chile</title>',encoding='utf8')
+ANIO=int(os.getenv('ANIO',str(datetime.now(ZoneInfo('America/Santiago')).year)))
+MAX_MB_DESCARGA=int(os.getenv('MAX_MB_DESCARGA','45'))
+MAX_REGISTROS=int(os.getenv('MAX_REGISTROS','15000'))
+CASOS_POR_EJECUCION=int(os.getenv('CASOS_POR_EJECUCION','1'))
+URL=f'https://data.open-contracting.org/es/publication/144/download?name={ANIO}.jsonl.gz'
+URL_REPLICA=f'https://fastly.data.open-contracting.org/downloads/chile_compra_api_releases/3730/{ANIO}.jsonl.gz'
+GRAPH_VERSION=os.getenv('META_GRAPH_VERSION','v25.0')
+GRAPH=f'{os.getenv("IG_GRAPH_BASE","https://graph.instagram.com").rstrip("/")}/{GRAPH_VERSION}'
+MEDIA_BRANCH=os.getenv('IG_MEDIA_BRANCH','instagram-media')
+MEDIA_PATH='cuanto_paga_chile/imagenes'
+STATE_ISSUE_TITLE='[BOT] Estado de publicaciones Cuánto Paga Chile'
+
+def media_url(name):
+    """URL permanente de la imagen en la rama de medios, independiente de Pages."""
+    repo=os.getenv('GITHUB_REPOSITORY','')
+    if '/' not in repo:
+        raise RuntimeError('GITHUB_REPOSITORY no configurado')
+    return (f'https://raw.githubusercontent.com/{repo}/'
+            f'{quote(MEDIA_BRANCH,safe="")}/{MEDIA_PATH}/{quote(name)}')
+
+
+def legacy_pages_url(name):
+    base=os.getenv('GH_PAGES_BASE_URL','').rstrip('/')
     if not base:
-        repo = os.getenv(
-            "GITHUB_REPOSITORY",
-            ""
-        )
+        repo=os.getenv('GITHUB_REPOSITORY','')
+        owner,repository=repo.split('/',1)
+        base=(f'https://{owner}.github.io/{repository}'
+              if repository.lower()!=f'{owner.lower()}.github.io'
+              else f'https://{owner}.github.io')
+    return f'{base}/media/{quote(name)}'
 
-        owner, repository = repo.split(
-            "/",
-            1
-        )
 
-        if repository.lower() == (
-            owner.lower() + ".github.io"
-        ):
-            base = (
-                f"https://{owner}.github.io"
-            )
-        else:
-            base = (
-                f"https://{owner}.github.io/"
-                f"{repository}"
-            )
-
-    return (
-        f"{base}/media/{quote(nombre)}"
-    )
+def github_api(method,path,*,data=None):
+    repo=os.getenv('GITHUB_REPOSITORY','')
+    token=os.getenv('GITHUB_TOKEN','')
+    if not repo or not token:
+        raise RuntimeError('Se requieren GITHUB_TOKEN y GITHUB_REPOSITORY')
+    r=requests.request(method,f'https://api.github.com/repos/{repo}{path}',
+        headers={'Authorization':f'Bearer {token}',
+                 'Accept':'application/vnd.github+json',
+                 'X-GitHub-Api-Version':'2022-11-28'},
+        json=data,timeout=60)
+    if r.status_code>=400:
+        raise RuntimeError(f'GitHub {method} {path}: HTTP {r.status_code} '
+                           f'{r.text[:220]}')
+    return r.json() if r.content else None
 
 
 def ensure_media_branch():
-    """
-    Crea la rama de imágenes si no existe.
-
-    No modifica la rama principal.
-    """
-
-    repo = os.getenv(
-        "GITHUB_REPOSITORY",
-        ""
-    )
-
-    token = os.getenv(
-        "GITHUB_TOKEN",
-        ""
-    )
-
-    detalles = github_request(
-        "GET",
-        ""
-    )
-
-    if detalles.get("private"):
-        raise RuntimeError(
-            "El repositorio debe ser público "
-            "para utilizar imágenes raw públicas."
-        )
-
-    encabezados = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    referencia = quote(
-        MEDIA_BRANCH,
-        safe=""
-    )
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{repo}/git/ref/heads/{referencia}"
-    )
-
-    respuesta = requests.get(
-        url,
-        headers=encabezados,
-        timeout=30,
-    )
-
-    if respuesta.status_code == 200:
+    """Crear rama de medios una sola vez; jamás modificar la rama principal."""
+    repo=os.getenv('GITHUB_REPOSITORY','')
+    details=github_api('GET','')
+    if details.get('private'):
+        raise RuntimeError('Para URLs raw públicas, el repositorio debe ser público')
+    ref=quote(MEDIA_BRANCH,safe='')
+    token=os.getenv('GITHUB_TOKEN','')
+    resp=requests.get(f'https://api.github.com/repos/{repo}/git/ref/heads/{ref}',
+        headers={'Authorization':f'Bearer {token}',
+                 'Accept':'application/vnd.github+json'},timeout=30)
+    if resp.status_code==200:
         return
-
-    if respuesta.status_code != 404:
-        raise RuntimeError(
-            "No se pudo consultar la rama "
-            f"de imágenes: HTTP "
-            f"{respuesta.status_code}"
-        )
-
-    principal = detalles["default_branch"]
-
-    referencia_principal = github_request(
-        "GET",
-        "/git/ref/heads/"
-        + quote(principal, safe="")
-    )
-
-    sha = referencia_principal[
-        "object"
-    ]["sha"]
-
+    if resp.status_code!=404:
+        raise RuntimeError(f'Error consultando rama de imágenes: HTTP {resp.status_code}')
+    default_branch=details.get('default_branch')
+    base=github_api('GET','/git/ref/heads/'+quote(default_branch,safe=''))
+    sha=base['object']['sha']
     try:
-        github_request(
-            "POST",
-            "/git/refs",
-            {
-                "ref": (
-                    f"refs/heads/{MEDIA_BRANCH}"
-                ),
-                "sha": sha,
-            }
-        )
-
-        log(
-            "Rama de imágenes creada:",
-            MEDIA_BRANCH
-        )
-
+        github_api('POST','/git/refs',data={
+            'ref':f'refs/heads/{MEDIA_BRANCH}', 'sha':sha})
+        print('Rama pública de imágenes creada:',MEDIA_BRANCH)
     except RuntimeError:
-        comprobacion = requests.get(
-            url,
-            headers=encabezados,
-            timeout=30,
-        )
-
-        if comprobacion.status_code != 200:
+        # Resolver un posible conflicto de creación concurrente.
+        check=requests.get(f'https://api.github.com/repos/{repo}/git/ref/heads/{ref}',
+            headers={'Authorization':f'Bearer {token}'},timeout=30)
+        if check.status_code!=200:
             raise
 
 
-def put_media(nombre, ruta):
-    """
-    Guarda un JPG de manera permanente
-    en la rama instagram-media.
-
-    Si el archivo ya existe con contenido
-    diferente, no lo sobrescribe.
-    """
-
+def put_media(name,path):
+    """Conservar cada JPG por nombre inmutable, como hace SISMONAUTA."""
     ensure_media_branch()
-
-    repo = os.getenv(
-        "GITHUB_REPOSITORY",
-        ""
-    )
-
-    token = os.getenv(
-        "GITHUB_TOKEN",
-        ""
-    )
-
-    archivo = f"{MEDIA_PATH}/{nombre}"
-
-    endpoint = (
-        "/contents/"
-        + quote(archivo, safe="/")
-    )
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{repo}{endpoint}"
-    )
-
-    encabezados = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    contenido = Path(ruta).read_bytes()
-
-    blob = (
-        f"blob {len(contenido)}\0"
-    ).encode("utf-8")
-
-    git_sha = hashlib.sha1(
-        blob + contenido
-    ).hexdigest()
-
-    respuesta = requests.get(
-        url,
-        headers=encabezados,
-        params={"ref": MEDIA_BRANCH},
-        timeout=30,
-    )
-
-    if respuesta.status_code == 200:
-        remoto = respuesta.json()
-
-        if remoto.get("sha") != git_sha:
-            raise RuntimeError(
-                "La imagen remota ya existe "
-                "con contenido distinto. "
-                "No se sobrescribirá."
-            )
-
-        return media_url(nombre)
-
-    if respuesta.status_code != 404:
-        raise RuntimeError(
-            "Error consultando imagen remota: "
-            f"HTTP {respuesta.status_code}"
-        )
-
-    datos = {
-        "message": (
-            f"Cuánto Paga Chile: {nombre}"
-        ),
-        "branch": MEDIA_BRANCH,
-        "content": base64.b64encode(
-            contenido
-        ).decode("ascii"),
-    }
-
+    repo=os.getenv('GITHUB_REPOSITORY','')
+    filepath=f'{MEDIA_PATH}/{name}'
+    endpoint='/contents/'+quote(filepath,safe='/')
+    data=path.read_bytes()
+    token=os.getenv('GITHUB_TOKEN','')
+    headers={'Authorization':f'Bearer {token}',
+             'Accept':'application/vnd.github+json',
+             'X-GitHub-Api-Version':'2022-11-28'}
+    query={'ref':MEDIA_BRANCH}
+    r=requests.get(f'https://api.github.com/repos/{repo}{endpoint}',
+                   headers=headers,params=query,timeout=30)
+    if r.status_code==200:
+        existing=r.json()
+        # Blob SHA permite comprobar si el contenido ya es el mismo.
+        blob='blob '+str(len(data))+'\0'
+        git_sha=hashlib.sha1(blob.encode('utf8')+data).hexdigest()
+        if existing.get('sha')!=git_sha:
+            raise RuntimeError('La imagen remota tiene otro contenido; no sobrescribir')
+        return media_url(name)
+    if r.status_code!=404:
+        raise RuntimeError(f'Error leyendo imagen remota: HTTP {r.status_code}')
+    body={'message':f'Cuánto Paga Chile: imagen {name}',
+          'branch':MEDIA_BRANCH,'content':base64.b64encode(data).decode('ascii')}
     try:
-        github_request(
-            "PUT",
-            endpoint,
-            datos
-        )
-
+        github_api('PUT',endpoint,data=body)
     except Exception:
-        comprobacion = requests.get(
-            url,
-            headers=encabezados,
-            params={"ref": MEDIA_BRANCH},
-            timeout=30,
-        )
-
-        if comprobacion.status_code == 200:
-            remoto = comprobacion.json()
-
-            if remoto.get("sha") == git_sha:
-                return media_url(nombre)
-
+        # El PUT pudo confirmarse remotamente aunque su respuesta se perdiera.
+        check=requests.get(f'https://api.github.com/repos/{repo}{endpoint}',
+                           headers=headers,params=query,timeout=30)
+        if check.status_code==200:
+            existing=check.json()
+            git_sha=hashlib.sha1((f'blob {len(data)}\0').encode()+data).hexdigest()
+            if existing.get('sha')==git_sha:
+                return media_url(name)
         raise
+    return media_url(name)
 
-    return media_url(nombre)
+# Historial persistente sin archivos adicionales en el repositorio: Issue de GitHub.
+# Requiere habilitar Issues y conceder "issues: write" al workflow.
+def issue_request(method,route,*,body=None):
+    token=os.getenv('GITHUB_TOKEN')
+    repo=os.getenv('GITHUB_REPOSITORY')
+    if not token or not repo:
+        raise RuntimeError('GITHUB_TOKEN y GITHUB_REPOSITORY son necesarios para mantener historial sin archivos extra')
+    url=f'https://api.github.com/repos/{repo}{route}'
+    r=requests.request(method,url,headers={
+        'Authorization':f'Bearer {token}',
+        'Accept':'application/vnd.github+json',
+        'X-GitHub-Api-Version':'2022-11-28'},json=body,timeout=40)
+    if r.status_code>=400:
+        raise RuntimeError(f'GitHub API ({r.status_code}): {r.text[:400]}')
+    return r.json() if r.content else None
 
+ISSUE_NUMBER=None
 
-def verificar_imagen_publica(url):
-    ultimo_error = "Sin respuesta"
-
-    for intento in range(15):
-        try:
-            respuesta = requests.get(
-                url,
-                stream=True,
-                timeout=25,
-            )
-
+def state_load():
+    global ISSUE_NUMBER
+    matches=issue_request('GET','/issues?state=all&per_page=100')
+    for it in matches:
+        if it.get('title')==STATE_ISSUE_TITLE and 'pull_request' not in it:
+            ISSUE_NUMBER=it['number']
             try:
-                tipo = respuesta.headers.get(
-                    "Content-Type",
-                    ""
-                ).lower()
+                data=json.loads(it.get('body') or '{}')
+            except ValueError:
+                raise RuntimeError('El issue de estado contiene JSON inválido; revísalo antes de seguir')
+            return {'history':data.get('history',[]),'pending':data.get('pending',[]),'abandoned':data.get('abandoned',[]),'uncertain':data.get('uncertain',[])}
+    created=issue_request('POST','/issues',body={
+        'title':STATE_ISSUE_TITLE,
+        'body':json.dumps({'history':[],'pending':[],'abandoned':[],'uncertain':[]},ensure_ascii=False,indent=2),
+        'labels':[]})
+    ISSUE_NUMBER=created['number']
+    return {'history':[],'pending':[],'abandoned':[],'uncertain':[]}
 
-                if (
-                    respuesta.ok
-                    and tipo.startswith("image/")
-                ):
-                    return True
+def state_save(data):
+    if not ISSUE_NUMBER:
+        raise RuntimeError('Primero es necesario cargar el issue de historial')
+    issue_request('PATCH',f'/issues/{ISSUE_NUMBER}',body={
+        'body':json.dumps(data,ensure_ascii=False,indent=2)})
 
-                ultimo_error = (
-                    f"HTTP {respuesta.status_code}"
-                )
+STATE=None
 
-            finally:
-                respuesta.close()
+def init_state():
+    global STATE
+    if STATE is None:
+        STATE=state_load()
+    return STATE
 
-        except requests.RequestException as exc:
-            ultimo_error = type(exc).__name__
-
-        if intento < 14:
-            time.sleep(4)
-
-    raise RuntimeError(
-        "La imagen pública no está "
-        "disponible para Instagram: "
-        + ultimo_error
-    )
-
-
-# ==========================================
-# RECUPERAR PENDIENTES
-# ==========================================
 
 def restore_pending_media():
+    """Restaurar pendientes desde la rama de medios o el sitio Pages antiguo.
+
+    No se reintenta ni se abandona una operación con estado incierto.
     """
-    Recupera imágenes desde la rama
-    permanente o desde GitHub Pages antiguo.
-
-    Si no existe una imagen y nunca fue
-    enviada, archiva el caso sin marcarlo
-    como publicado.
-    """
-
-    estado = init_state()
-
-    pendientes = estado.get(
-        "pending",
-        []
-    )
-
-    if not pendientes:
+    state=init_state()
+    if not state.get('pending'):
         return []
-
-    recuperados = []
-    modificacion = False
-
-    abandonados = estado.setdefault(
-        "abandoned",
-        []
-    )
-
-    for pendiente in pendientes:
-        status = pendiente.get(
-            "instagram_status",
-            "pending"
-        )
-
-        if status in (
-            "uncertain",
-            "sending",
-        ):
-            log(
-                "Envío incierto:",
-                pendiente.get("ocid"),
-                "No reintentar automáticamente."
-            )
-
-            recuperados.append(pendiente)
+    recoverable=[]
+    changed=False
+    abandoned=state.setdefault('abandoned',[])
+    for job in state['pending']:
+        status=job.get('instagram_status','pending')
+        if status in ('uncertain','sending'):
+            print('SIN REINTENTO: publicación incierta:',job.get('ocid'))
+            recoverable.append(job)
             continue
-
-        nombre = pendiente["media_name"]
-
-        ruta = MEDIA / nombre
-
-        problema = None
-
-        if not ruta.is_file():
-            for url in (
-                media_url(nombre),
-                legacy_pages_url(nombre),
-            ):
+        path=MEDIA/job['media_name']
+        problem=None
+        if not path.is_file():
+            for url in (media_url(job['media_name']),legacy_pages_url(job['media_name'])):
                 try:
-                    respuesta = requests.get(
-                        url,
-                        timeout=35,
-                    )
-
-                    respuesta.raise_for_status()
-
-                    tipo = respuesta.headers.get(
-                        "Content-Type",
-                        ""
-                    ).lower()
-
-                    if not tipo.startswith("image/"):
-                        raise ValueError(
-                            "El recurso no es una imagen"
-                        )
-
-                    ruta.write_bytes(
-                        respuesta.content
-                    )
-
-                    with Image.open(ruta) as img:
-                        img.verify()
-
-                    problema = None
-
-                    log(
-                        "Imagen pendiente recuperada:",
-                        nombre
-                    )
-
+                    r=requests.get(url,timeout=35)
+                    r.raise_for_status()
+                    if not r.headers.get('content-type','').lower().startswith('image/'):
+                        raise ValueError('El recurso remoto no es una imagen')
+                    path.write_bytes(r.content)
+                    with Image.open(path) as img:img.verify()
+                    problem=None
+                    print('Imagen pendiente recuperada:',url)
                     break
-
-                except (
-                    requests.RequestException,
-                    OSError,
-                    ValueError,
-                ) as exc:
-                    problema = (
-                        type(exc).__name__
-                        + ": "
-                        + str(exc)[:150]
-                    )
-
-                    ruta.unlink(
-                        missing_ok=True
-                    )
-
-        if problema:
-            modificacion = True
-
-            uid = pendiente["unique_id"]
-
-            if pendiente.get(
-                "published",
-                {}
-            ).get("instagram"):
-                if uid not in estado["history"]:
-                    estado["history"].append(uid)
-
-            elif not any(
-                p.get("unique_id") == uid
-                for p in abandonados
-            ):
-                abandonados.append({
-                    "unique_id": uid,
-                    "ocid": pendiente.get(
-                        "ocid", ""
-                    ),
-                    "status": "NO_PUBLICADO",
-                    "reason": problema,
-                })
-
-            log(
-                "Imagen antigua no recuperable:",
-                pendiente.get("ocid")
-            )
-
+                except (requests.RequestException,OSError,ValueError) as exc:
+                    problem=f'{type(exc).__name__}: {str(exc)[:150]}'
+                    path.unlink(missing_ok=True)
+        if problem:
+            changed=True
+            if job.get('published',{}).get('instagram'):
+                if job['unique_id'] not in state['history']:
+                    state['history'].append(job['unique_id'])
+            elif not any(x.get('unique_id')==job['unique_id'] for x in abandoned):
+                abandoned.append({'unique_id':job['unique_id'],'ocid':job.get('ocid',''),
+                    'status':'NO_PUBLICADO','reason':'Imagen histórica ausente: '+problem})
+            print('Imagen antigua no recuperable; caso archivado:',job.get('ocid'))
             continue
-
-        recuperados.append(pendiente)
-
-    if modificacion:
-        estado["pending"] = recuperados
-        state_save(estado)
-
-    return recuperados
-
-
-# ==========================================
-# DESCARGA DE DATOS OCDS
-# ==========================================
-
-def descargar_registros(
-    url,
-    max_mb=MAX_MB_DESCARGA,
-    max_records=MAX_REGISTROS
-):
-    log(
-        "Consultando datos abiertos OCDS:",
-        url
-    )
-
-    registros = []
-    buffer = b""
-    recibidos = 0
-
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(20, 90),
-        headers={
-            "User-Agent": (
-                "CuantoPagaChile/2.0 "
-                "(open contracting data research)"
-            )
-        },
-    ) as respuesta:
-
-        respuesta.raise_for_status()
-
-        descompresor = zlib.decompressobj(
-            16 + zlib.MAX_WBITS
-        )
-
-        for bloque in respuesta.iter_content(
-            chunk_size=256 * 1024
-        ):
-            if not bloque:
-                continue
-
-            recibidos += len(bloque)
-
-            buffer += descompresor.decompress(
-                bloque
-            )
-
-            lineas = buffer.split(b"\n")
-            buffer = lineas.pop()
-
-            for linea in lineas:
-                if not linea.strip():
-                    continue
-
-                try:
-                    registros.append(
-                        json.loads(linea)
-                    )
-
-                except (
-                    ValueError,
-                    UnicodeDecodeError,
-                ):
-                    continue
-
-                if len(registros) >= max_records:
-                    break
-
-            if (
-                recibidos >= max_mb * 1024 * 1024
-                or len(registros) >= max_records
-            ):
-                break
-
-    log(
-        "Registros descargados:",
-        len(registros),
-        "| MB:",
-        round(recibidos / 1048576, 2)
-    )
-
-    if not registros:
-        raise RuntimeError(
-            "La fuente no devolvió registros "
-            "OCDS válidos."
-        )
-
-    return registros
-
-
-def obtener_datos():
-    errores = []
-
-    for url in URLS:
-        try:
-            registros = descargar_registros(
-                url
-            )
-
-            if registros:
-                return registros, url
-
-        except Exception as exc:
-            errores.append(
-                safe_error(exc)
-            )
-
-            log(
-                "Fuente no disponible:",
-                safe_error(exc)
-            )
-
-    raise RuntimeError(
-        "No fue posible consultar datos "
-        "abiertos reales. "
-        + " | ".join(errores)
-    )
-
-
-def iterar_releases(registro):
-    if not isinstance(
-        registro,
-        dict
-    ):
-        return
-
-    compilado = registro.get(
-        "compiledRelease"
-    )
-
-    if isinstance(compilado, dict):
-        yield compilado
-        return
-
-    releases = registro.get(
-        "releases"
-    )
-
-    if isinstance(releases, list):
-        for release in releases:
-            if isinstance(release, dict):
-                yield release
-        return
-
-    if (
-        "awards" in registro
-        or "tender" in registro
-    ):
-        yield registro
-
-
-def extraer_items(
-    registros,
-    fuente
-):
-    items = []
-
-    for registro in registros:
-        for release in iterar_releases(
-            registro
-        ):
-            comprador = (
-                (release.get("buyer") or {})
-                .get("name")
-                or "Organismo no indicado"
-            )
-
-            ocid = (
-                release.get("ocid")
-                or registro.get("ocid")
-                or ""
-            )
-
-            fecha_registro = (
-                release.get("date") or ""
-            )
-
-            for award in release.get(
-                "awards", []
-            ) or []:
-                if not isinstance(award, dict):
-                    continue
-
-                status = str(
-                    award.get("status", "")
-                ).lower()
-
-                if status in (
-                    "cancelled",
-                    "canceled",
-                    "unsuccessful",
-                ):
-                    continue
-
-                proveedores = award.get(
-                    "suppliers"
-                ) or []
-
-                proveedor = "No indicado"
-
-                if (
-                    proveedores
-                    and isinstance(
-                        proveedores[0],
-                        dict
-                    )
-                ):
-                    proveedor = (
-                        proveedores[0].get("name")
-                        or "No indicado"
-                    )
-
-                for item in award.get(
-                    "items", []
-                ) or []:
-                    if not isinstance(item, dict):
-                        continue
-
-                    descripcion = (
-                        item.get("description")
-                        or (
-                            item.get(
-                                "classification"
-                            ) or {}
-                        ).get("description")
-                        or ""
-                    )
-
-                    unidad = (
-                        item.get("unit") or {}
-                    )
-
-                    if not isinstance(
-                        unidad,
-                        dict
-                    ):
-                        unidad = {}
-
-                    valor = (
-                        unidad.get("value") or {}
-                    )
-
-                    if not isinstance(
-                        valor,
-                        dict
-                    ):
-                        valor = {}
-
-                    precio = numero(
-                        valor.get("amount")
-                    )
-
-                    moneda = (
-                        valor.get("currency")
-                        or (
-                            award.get("value") or {}
-                        ).get("currency")
-                    )
-
-                    cantidad = numero(
-                        item.get("quantity")
-                    )
-
-                    nombre_unidad = (
-                        unidad.get("name")
-                        or unidad.get("id")
-                        or ""
-                    )
-
-                    clave = normalizar(
-                        descripcion
-                    )
-
-                    if not (
-                        ocid
-                        and precio is not None
-                        and precio > 0
-                        and moneda == "CLP"
-                        and len(clave) >= 12
-                        and len(clave.split()) >= 2
-                    ):
-                        continue
-
-                    if (
-                        cantidad is not None
-                        and cantidad <= 0
-                    ):
-                        continue
-
-                    items.append({
-                        "ocid": ocid,
-                        "award_id": award.get(
-                            "id", ""
-                        ),
-                        "fecha_adjudicacion": (
-                            award.get("date") or ""
-                        ),
-                        "fecha_registro": (
-                            fecha_registro
-                        ),
-                        "comprador": comprador,
-                        "proveedor": proveedor,
-                        "descripcion": descripcion,
-                        "clave": clave,
-                        "precio_unitario": precio,
-                        "cantidad": cantidad,
-                        "unidad": normalizar(
-                            nombre_unidad
-                        ),
-                        "moneda": "CLP",
-                        "fuente": fuente,
-                    })
-
-    return items
-
-
-# ==========================================
-# COMPARACION DE ADJUDICACIONES
-# ==========================================
-
-def seleccionar_casos(
-    items,
-    estado
-):
-    grupos = defaultdict(list)
-
-    for item in items:
-        grupos[
-            (
-                item["clave"],
-                item["unidad"]
-            )
-        ].append(item)
-
-    comparables = []
-
-    for grupo in grupos.values():
-        por_proceso = {}
-
-        for item in grupo:
-            if item["ocid"]:
-                por_proceso.setdefault(
-                    item["ocid"],
-                    item
-                )
-
-        valores = list(
-            por_proceso.values()
-        )
-
-        if len(valores) < 3:
-            continue
-
-        for caso in valores:
-            if not caso.get(
-                "fecha_adjudicacion"
-            ):
-                continue
-
-            referencias = [
-                r["precio_unitario"]
-                for r in valores
-                if r["ocid"] != caso["ocid"]
-            ]
-
-            if len(referencias) < 2:
-                continue
-
-            if min(referencias) <= 0:
-                continue
-
-            if (
-                max(referencias)
-                / min(referencias)
-                > 4
-            ):
-                continue
-
-            mediana = statistics.median(
-                referencias
-            )
-
-            diferencia = (
-                caso["precio_unitario"]
-                / mediana
-                - 1
-            ) * 100
-
-            comparables.append({
-                "caso": caso,
-                "ref": mediana,
-                "dif": diferencia,
-                "nref": len(referencias),
-            })
-
-    historial = set(
-        estado.get("history", [])
-    )
-
-    for categoria in (
-        "pending",
-        "abandoned",
-        "uncertain",
-    ):
-        historial.update(
-            item["unique_id"]
-            for item in estado.get(
-                categoria, []
-            )
-            if "unique_id" in item
-        )
-
-    random.SystemRandom().shuffle(
-        comparables
-    )
-
-    seleccionados = []
-    procesos = set()
-    vistos = set()
-
-    for entry in comparables:
-        caso = entry["caso"]
-
-        uid = identificador(
-            caso
-        )
-
-        if (
-            uid in historial
-            or uid in vistos
-            or caso["ocid"] in procesos
-        ):
-            continue
-
-        vistos.add(uid)
-        procesos.add(caso["ocid"])
-
-        entry["unique_id"] = uid
-
-        seleccionados.append(entry)
-
-        if (
-            len(seleccionados)
-            >= CASOS_POR_EJECUCION
-        ):
-            break
-
-    return seleccionados
-
-
-# ==========================================
-# TIPOGRAFIA Y DISEÑO
-# ==========================================
-
-def fuente(
-    tamano,
-    negrita=False
-):
-    nombre = (
-        "DejaVuSans-Bold.ttf"
-        if negrita
-        else "DejaVuSans.ttf"
-    )
-
-    rutas = [
-        (
-            "/usr/share/fonts/"
-            "truetype/dejavu/"
-            + nombre
-        ),
-        (
-            "/usr/share/fonts/"
-            "truetype/liberation2/"
-            + nombre
-        ),
-    ]
-
-    for ruta in rutas:
-        try:
-            return ImageFont.truetype(
-                ruta,
-                tamano
-            )
-
-        except OSError:
-            pass
-
+        recoverable.append(job)
+    if changed:
+        state['pending']=recoverable
+        state_save(state)
+    return recoverable
+
+def require_env(*keys):
+    missing=[k for k in keys if not os.getenv(k)]
+    if missing:raise RuntimeError('Faltan GitHub Secrets: '+', '.join(missing))
+
+
+def instagram_credentials():
+    """Valida presencia y formato sin escribir secretos en los logs."""
+    raw = os.getenv('INSTAGRAM_ACCESS_TOKEN') or os.getenv('INSTAGRAM_TOKEN') or ''
+    user = (os.getenv('IG_USER_ID') or os.getenv('INSTAGRAM_USER_ID') or '').strip()
+    if not raw:
+        raise RuntimeError('INSTAGRAM_ACCESS_TOKEN está vacío o no se entregó a GitHub Actions')
+    if raw != raw.strip():
+        raise RuntimeError('INSTAGRAM_ACCESS_TOKEN tiene espacios o saltos de línea al inicio/final')
+    token = raw.strip()
+    if (token.lower().startswith('bearer ') or any(c.isspace() for c in token)
+            or token.startswith(("'", '"')) or token.endswith(("'", '"'))):
+        raise RuntimeError('Formato de token incorrecto: sin Bearer, comillas ni espacios')
+    if not user or not user.isdigit():
+        raise RuntimeError('IG_USER_ID debe ser el ID profesional numérico de Instagram')
+    print('INSTAGRAM: secreto presente; formato básico correcto; ID numérico configurado.')
+    return user, token
+
+def meta_request(method,path,token,*,data=None,timeout=75):
+    """Instagram Login: access_token como parámetro GET o dato POST."""
+    values={**(data or {}),'access_token':token}
+    url=GRAPH+'/'+path.lstrip('/')
     try:
-        return ImageFont.load_default(
-            size=tamano
-        )
-
-    except TypeError:
-        return ImageFont.load_default()
-
-
-def crear_imagen(
-    entry,
-    destino
-):
-    caso = entry["caso"]
-
-    precio = dinero(
-        caso["precio_unitario"]
-    )
-
-    diferencia = entry["dif"]
-
-    referencia = entry["ref"]
-
-    W = 1080
-    H = 1350
-
-    imagen = Image.new(
-        "RGB",
-        (W, H),
-        "#0a1223"
-    )
-
-    d = ImageDraw.Draw(
-        imagen
-    )
-
-    def ancho(texto, f):
-        caja = d.textbbox(
-            (0, 0),
-            str(texto),
-            font=f
-        )
-
-        return caja[2] - caja[0]
-
-    def centrado(
-        texto,
-        y,
-        tamano,
-        color
-    ):
-        f = fuente(
-            tamano,
-            True
-        )
-
-        while (
-            tamano > 18
-            and ancho(texto, f) > 950
-        ):
-            tamano -= 2
-
-            f = fuente(
-                tamano,
-                True
-            )
-
-        x = (
-            W - ancho(texto, f)
-        ) // 2
-
-        d.text(
-            (x, y),
-            texto,
-            font=f,
-            fill=color
-        )
-
-    def lineas(
-        texto,
-        f,
-        max_width=940
-    ):
-        resultado = []
-        actual = ""
-
-        for palabra in str(
-            texto
-        ).split():
-            prueba = (
-                actual + " " + palabra
-            ).strip()
-
-            if (
-                ancho(prueba, f)
-                <= max_width
-            ):
-                actual = prueba
-            else:
-                if actual:
-                    resultado.append(
-                        actual
-                    )
-
-                actual = palabra
-
-        if actual:
-            resultado.append(
-                actual
-            )
-
-        return resultado
-
-    def bloque(
-        texto,
-        x,
-        y,
-        tamano,
-        color,
-        max_lineas=2
-    ):
-        f = fuente(
-            tamano
-        )
-
-        partes = lineas(
-            texto,
-            f
-        )
-
-        for linea in partes[
-            :max_lineas
-        ]:
-            d.text(
-                (x, y),
-                linea,
-                font=f,
-                fill=color
-            )
-
-            y += tamano + 9
-
-        return y
-
-    # Panel superior
-    d.rounded_rectangle(
-        (35, 35, 1045, 670),
-        radius=38,
-        fill="#15243f"
-    )
-
-    centrado(
-        "PRECIO UNITARIO ADJUDICADO",
-        88,
-        28,
-        "#c8d7f0"
-    )
-
-    centrado(
-        precio,
-        155,
-        110,
-        "#ffdf62"
-    )
-
-    centrado(
-        "DIFERENCIA VS OTRAS ADJUDICACIONES",
-        320,
-        26,
-        "#c8d7f0"
-    )
-
-    if diferencia > 0:
-        color = "#ff5c5c"
-    elif diferencia < 0:
-        color = "#30d07d"
-    else:
-        color = "#ffd84d"
-
-    porcentaje = (
-        f"{diferencia:+.1f}%"
-        if diferencia != 0
-        else "0.0%"
-    )
-
-    centrado(
-        porcentaje,
-        385,
-        130,
-        color
-    )
-
-    centrado(
-        "Mediana de referencia: "
-        + dinero(referencia),
-        565,
-        33,
-        "#f4f7fc"
-    )
-
-    # Información inferior
-    d.text(
-        (68, 714),
-        "DETALLES DE LA ADJUDICACIÓN",
-        font=fuente(30, True),
-        fill="#f1f5fb"
-    )
-
-    d.line(
-        (68, 760, 1012, 760),
-        fill="#364760",
-        width=2
-    )
-
-    fecha = (
-        fecha_legible(
-            caso["fecha_adjudicacion"]
-        )
-        or "No consta"
-    )
-
-    campos = [
-        (
-            "ARTÍCULO",
-            caso["descripcion"],
-            3,
-        ),
-        (
-            "ORGANISMO",
-            caso["comprador"],
-            2,
-        ),
-        (
-            "PROVEEDOR ADJUDICADO",
-            caso["proveedor"],
-            2,
-        ),
-        (
-            "FECHA DE ADJUDICACIÓN",
-            fecha,
-            1,
-        ),
-        (
-            "IDENTIFICADOR",
-            caso["ocid"],
-            2,
-        ),
-    ]
-
-    y = 785
-
-    for titulo, valor, limite in campos:
-        if y >= 1190:
-            break
-
-        d.text(
-            (70, y),
-            titulo,
-            font=fuente(21, True),
-            fill="#75baff"
-        )
-
-        y += 30
-
-        y = bloque(
-            valor,
-            70,
-            y,
-            26,
-            "#f1f5fb",
-            limite
-        )
-
-        y += 15
-
-    d.rectangle(
-        (0, 1260, 1080, 1350),
-        fill="#07101e"
-    )
-
-    d.text(
-        (65, 1296),
-        "Fuente: ChileCompra vía OCP",
-        font=fuente(21, True),
-        fill="#ffd28a"
-    )
-
-    imagen.save(
-        destino,
-        "JPEG",
-        quality=92,
-        optimize=True
-    )
-
-
-# ==========================================
-# PIE PERIODISTICO
-# ==========================================
-
-def crear_caption(
-    entry,
-    todos
-):
-    caso = entry["caso"]
-
-    precio = dinero(
-        caso["precio_unitario"]
-    )
-
-    mediana = dinero(
-        entry["ref"]
-    )
-
-    diferencia = entry["dif"]
-
-    fecha = fecha_legible(
-        caso["fecha_adjudicacion"]
-    )
-
-    if diferencia > 0:
-        comparacion = (
-            f"{abs(diferencia):.1f}% superior"
-        )
-    elif diferencia < 0:
-        comparacion = (
-            f"{abs(diferencia):.1f}% inferior"
-        )
-    else:
-        comparacion = "igual"
-
-    anteriores = set()
-
-    fecha_caso = fecha_ordenable(
-        caso["fecha_adjudicacion"]
-    )
-
-    if fecha_caso:
-        for otro in todos:
-            fecha_otro = fecha_ordenable(
-                otro.get("fecha_adjudicacion")
-            )
-
-            if (
-                otro["ocid"] != caso["ocid"]
-                and otro["clave"] == caso["clave"]
-                and otro["unidad"] == caso["unidad"]
-                and fecha_otro
-                and fecha_otro < fecha_caso
-            ):
-                anteriores.add(
-                    otro["proveedor"]
-                )
-
-    texto = (
-        "=== CUANTO PAGA CHILE? === 🔎 "
-        "¿Qué muestran los registros de esta "
-        "adjudicación pública?/n "
-
-        "En los datos abiertos de compras "
-        "públicas de Chile a partir "
-        "de información de ChileCompra, "
-        f"encontramos el proceso {caso['ocid']}, "
-        f"en el que figura {caso['comprador']} "
-        "como organismo comprador y "
-        f"{caso['proveedor']} como proveedor "
-        "adjudicado./n "
-
-        f"El artículo descrito como "
-        f"«{caso['descripcion']}» registra "
-        f"un precio unitario de {precio} "
-        "pesos chilenos. "
-    )
-
-    if fecha:
-        texto += (
-            f"La adjudicación está fechada "
-            f"el {fecha}./n "
-        )
-
-    texto += (
-        "Para poner la cifra en contexto, "
-        f"contrastamos el precio unitario "
-        f"de {precio} con otras "
-        f"{entry['nref']} adjudicaciones "
-        "del archivo descargado que presentan "
-        "una descripción normalizada y unidad "
-        "de medida idénticas. "
-
-        f"La mediana de esas referencias fue "
-        f"{mediana}, por lo que el precio "
-        f"reportado resulta {comparacion} "
-        "a ese parámetro. "
-    )
-
-    if anteriores:
-        nombres = ", ".join(
-            sorted(anteriores)[:2]
-        )
-
-        texto += (
-            "Entre los antecedentes previos "
-            "observados para el mismo artículo "
-            "aparecen proveedores como "
-            f"{nombres}./n "
-        )
-
-    texto += (
-        "NOTA: Las cifras corresponden a "
-        "adjudicaciones, no necesariamente "
-        "a pagos realizados. "
-
-        f"Fuente: ChileCompra vía OCP "
-        f"({OCP_URL}). "
-
-        f"Consulta: {fecha_consulta()}. "
-
-        "#ComprasPúblicas #ChileCompra "
-        "#DatosAbiertos #Transparencia #Chile"
-    )
-
-    if len(texto) > 2200:
-        raise ValueError(
-            "El pie supera los "
-            "2200 caracteres de Instagram"
-        )
-
-    return texto
-
-
-# ==========================================
-# GENERAR PUBLICACIONES
-# ==========================================
-
-def generar():
-    """
-    Primero valida Instagram cuando
-    la publicación real está activada.
-
-    Así no se crean nuevos casos pendientes
-    si el token de Meta es inválido.
-    """
-
-    if PUBLISH_ENABLED:
-        instagram_check()
-
-    estado = init_state()
-
-    # Recuperar publicaciones anteriores.
-    if estado["pending"]:
-        if PUBLISH_ENABLED:
-            recuperados = restore_pending_media()
-
-            seguros = [
-                p for p in recuperados
-                if p.get(
-                    "instagram_status",
-                    "pending"
-                ) == "pending"
-            ]
-
-            if seguros:
-                log(
-                    "Casos pendientes recuperados:",
-                    len(seguros)
-                )
-                return
-
-            inciertos = [
-                p for p in estado["pending"]
-                if p.get("instagram_status")
-                in ("uncertain", "sending")
-            ]
-
-            for pendiente in inciertos:
-                if not any(
-                    x.get("unique_id")
-                    == pendiente["unique_id"]
-                    for x in estado["uncertain"]
-                ):
-                    estado["uncertain"].append(
-                        pendiente
-                    )
-
-            estado["pending"] = []
-
-            state_save(estado)
-
-        else:
-            log(
-                "Modo prueba: sin publicación real."
-            )
-
-            inciertos = [
-                p for p in estado["pending"]
-                if p.get("instagram_status")
-                in ("uncertain", "sending")
-            ]
-
-            for pendiente in inciertos:
-                if not any(
-                    x.get("unique_id")
-                    == pendiente["unique_id"]
-                    for x in estado["uncertain"]
-                ):
-                    estado["uncertain"].append(
-                        pendiente
-                    )
-
-            estado["pending"] = []
-
-            state_save(estado)
-
-    registros, fuente = obtener_datos()
-
-    items = extraer_items(
-        registros,
-        fuente
-    )
-
-    log(
-        "Ítems válidos encontrados:",
-        len(items)
-    )
-
-    if not items:
-        raise RuntimeError(
-            "No se encontraron adjudicaciones "
-            "con precio unitario CLP verificable."
-        )
-
-    seleccionados = seleccionar_casos(
-        items,
-        estado
-    )
-
-    if not seleccionados:
-        raise RuntimeError(
-            "No se encontraron casos nuevos "
-            "con referencias comparables. "
-            "Amplía MAX_REGISTROS o utiliza "
-            "otro ANIO. No se repetirá "
-            "un caso publicado."
-        )
-
-    nuevos = []
-
-    for entry in seleccionados:
-        uid = entry["unique_id"]
-
-        nombre = (
-            hashlib.sha256(
-                uid.encode("utf-8")
-            ).hexdigest()[:24]
-            + ".jpg"
-        )
-
-        destino = MEDIA / nombre
-
+        r=(requests.get(url,params=values,timeout=timeout) if method=='GET'
+           else requests.post(url,data=values,timeout=timeout))
+    except requests.RequestException as exc:
+        raise RuntimeError('No fue posible conectar con Meta: '+type(exc).__name__) from exc
+    try: body=r.json()
+    except ValueError:
+        raise RuntimeError(f'Instagram API HTTP {r.status_code}: respuesta no JSON')
+    if r.status_code>=400 or body.get('error'):
+        err=body.get('error') or {}
+        code=err.get('code','?')
+        message=str(err.get('message','Error desconocido')).replace(token,'[REDACTADO]')[:230]
+        if str(code)=='190':
+            raise RuntimeError('Instagram OAuth 190: '+message+'. Meta rechazó el token. '
+                'Genera un token Instagram Login para @cuantopagachile y actualiza '
+                'INSTAGRAM_ACCESS_TOKEN en GitHub Secrets. Comprueba secretos del entorno.')
+        raise RuntimeError(f'Instagram API HTTP {r.status_code} código {code}: {message}')
+    return body
+
+def instagram_check():
+    """Preflight sin publicar, inspirado en ig_check de SISMONAUTA."""
+    user,token=instagram_credentials()
+    try:
+        info=meta_request('GET','me',token,data={'fields':'id,user_id,username'})
+    except RuntimeError as exc:
+        if 'user_id' not in str(exc).lower() or '190' in str(exc):
+            raise
+        info=meta_request('GET','me',token,data={'fields':'id,username'})
+    account=str(info.get('username') or '').strip().lower().lstrip('@')
+    expected=os.getenv('IG_EXPECTED_USERNAME','').strip().lower().lstrip('@')
+    if expected and account!=expected:
+        raise RuntimeError(f'Cuenta Instagram incorrecta: esperada @{expected}, obtenida @{account}')
+    valid_ids={str(info.get(k) or '') for k in ('id','user_id')}
+    if user not in valid_ids:
+        direct=meta_request('GET',user,token,data={'fields':'id,username'})
+        if str(direct.get('id'))!=user or str(direct.get('username','')).lower()!=account:
+            raise RuntimeError('IG_USER_ID no coincide con el token autorizado')
+    print(f'INSTAGRAM CHECK OK: @{account}; ID profesional verificado')
+    return user,token
+
+
+def check_public_image(url):
+    for intento in range(15):
         try:
-            caption = crear_caption(
-                entry,
-                items
-            )
-
-            crear_imagen(
-                entry,
-                destino
-            )
-
-        except Exception as exc:
-            log(
-                "Caso descartado:",
-                safe_error(exc)
-            )
-
-            continue
-
-        respaldo = {
-            "unique_id": uid,
-            "ocid": entry["caso"]["ocid"],
-            "media_name": nombre,
-            "caption": caption,
-            "instagram_status": "pending",
-            "published": {
-                "instagram": None
-            },
-        }
-
-        nuevos.append(
-            respaldo
-        )
-
-        # Copia local del análisis.
-        carpeta_caso = (
-            CARPETA
-            / hashlib.sha256(
-                uid.encode("utf-8")
-            ).hexdigest()[:12]
-        )
-
-        carpeta_caso.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        (carpeta_caso / "caption.txt").write_text(
-            caption,
-            encoding="utf-8"
-        )
-
-        (carpeta_caso / "respaldo.json").write_text(
-            json.dumps(
-                {
-                    "fuente": fuente,
-                    "fecha_consulta": fecha_consulta(),
-                    "caso": entry["caso"],
-                    "mediana": entry["ref"],
-                    "diferencia_pct": entry["dif"],
-                    "n_referencias": entry["nref"],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8"
-        )
-
-        log(
-            "Publicación preparada:",
-            entry["caso"]["ocid"]
-        )
-
-    if not nuevos:
-        raise RuntimeError(
-            "No se consiguió generar "
-            "ninguna publicación válida."
-        )
-
-    estado["pending"] = nuevos
-
-    state_save(estado)
-
-    log(
-        "Publicaciones preparadas:",
-        len(nuevos)
-    )
+            r=requests.get(url,timeout=25,stream=True)
+            try:
+                if r.ok and r.headers.get('Content-Type','').lower().startswith('image/'):
+                    return
+                last=f'HTTP {r.status_code}'
+            finally:r.close()
+        except requests.RequestException as exc:
+            last=type(exc).__name__
+        if intento<14:time.sleep(4)
+    raise RuntimeError('La imagen pública de GitHub no está disponible: '+last)
 
 
-# ==========================================
-# PUBLICACION EN INSTAGRAM
-# ==========================================
-
-def instagram_publish(
-    image_url,
-    caption,
-    user,
-    token
-):
-    """
-    1. Crear contenedor.
-    2. Esperar procesamiento.
-    3. Publicar el contenedor.
-
-    Solo se invoca después de guardar
-    un estado de envío incierto.
-    """
-
-    respuesta = meta_request(
-        "POST",
-        f"{user}/media",
-        token,
-        {
-            "image_url": image_url,
-            "caption": caption,
-        }
-    )
-
-    contenedor = respuesta.get(
-        "id"
-    )
-
-    if not contenedor:
-        raise RuntimeError(
-            "Instagram no devolvió "
-            "ID del contenedor"
-        )
-
-    log(
-        "Contenedor de Instagram creado:",
-        contenedor
-    )
-
-    for intento in range(18):
+def instagram_publish(url,caption,user,token):
+    # Solo invocar después de persistir status=uncertain, nunca reintentar a ciegas.
+    container=meta_request('POST',f'{user}/media',token,
+        data={'image_url':url,'caption':caption})['id']
+    print('Instagram contenedor creado:',container)
+    for _ in range(18):
         time.sleep(8)
-
-        estado = meta_request(
-            "GET",
-            str(contenedor),
-            token,
-            {
-                "fields": "status_code"
-            }
-        )
-
-        status = estado.get(
-            "status_code"
-        )
-
-        if status == "FINISHED":
-            break
-
-        if status in (
-            "ERROR",
-            "EXPIRED",
-        ):
-            raise RuntimeError(
-                "Instagram rechazó el "
-                "contenedor: "
-                + str(status)
-            )
-
+        status=meta_request('GET',str(container),token,
+            data={'fields':'status_code'}).get('status_code')
+        if status=='FINISHED':break
+        if status in ('ERROR','EXPIRED'):
+            raise RuntimeError('Instagram rechazó contenedor: '+str(status))
     else:
-        raise RuntimeError(
-            "El contenedor no terminó "
-            "de procesarse."
-        )
+        raise RuntimeError('Instagram no confirmó el procesamiento del contenedor')
+    result=meta_request('POST',f'{user}/media_publish',token,
+        data={'creation_id':container})
+    if not result.get('id'):
+        raise RuntimeError('Instagram no devolvió ID de publicación; revisar manualmente')
+    return str(result['id'])
 
-    resultado = meta_request(
-        "POST",
-        f"{user}/media_publish",
-        token,
-        {
-            "creation_id": contenedor
-        }
-    )
-
-    post_id = resultado.get(
-        "id"
-    )
-
-    if not post_id:
-        raise RuntimeError(
-            "Instagram no devolvió ID "
-            "de publicación. "
-            "Revisar manualmente."
-        )
-
-    return str(post_id)
-
-
-# ==========================================
-# PUBLICAR Y MANTENER HISTORIAL
-# ==========================================
 
 def publicar():
-    """
-    Publica solamente en Instagram.
-
-    Evita repetir automáticamente
-    operaciones de resultado incierto.
-    """
-
-    estado = init_state()
-
-    pendientes = estado[
-        "pending"
-    ]
-
-    if not pendientes:
-        log(
-            "No hay publicaciones pendientes."
-        )
+    state=init_state()
+    if not state['pending']:
+        print('No hay publicaciones pendientes.')
         return
-
-    if not PUBLISH_ENABLED:
-        log(
-            "Publicación desactivada. "
-            "Solo vista previa."
-        )
+    if os.getenv('PUBLISH_ENABLED','false').lower()!='true':
+        print('VISTA PREVIA: publicación desactivada.')
         return
-
-    # Autenticación antes del primer POST.
-    user, token = instagram_check()
-
-    errores = []
-
-    for pendiente in list(
-        pendientes
-    ):
-        uid = pendiente["unique_id"]
-
-        publicado = pendiente.get(
-            "published",
-            {}
-        ).get("instagram")
-
-        if publicado:
-            if uid not in estado["history"]:
-                estado["history"].append(
-                    uid
-                )
-
-            pendientes.remove(
-                pendiente
-            )
-
-            state_save(estado)
-
+    user,token=instagram_check()   # VALIDAR ANTES DE CUALQUIER POST
+    errores=[]
+    for job in list(state['pending']):
+        uid=job['unique_id']
+        if job.get('published',{}).get('instagram'):
+            if uid not in state['history']:state['history'].append(uid)
+            state['pending'].remove(job)
+            state_save(state)
             continue
-
-        status = pendiente.get(
-            "instagram_status",
-            "pending"
-        )
-
-        if status in (
-            "uncertain",
-            "sending",
-        ):
-            log(
-                "SIN REINTENTO:",
-                pendiente.get("ocid"),
-                "envío de resultado incierto."
-            )
+        if job.get('instagram_status') in ('sending','uncertain'):
+            print('SIN REINTENTO AUTOMÁTICO: envío incierto; revisar Instagram y GitHub Issue:',job.get('ocid'))
             continue
-
-        if status != "pending":
-            raise RuntimeError(
-                "Estado de Instagram "
-                "desconocido: "
-                + str(status)
-            )
-
-        # Preparación de imagen ANTES del envío.
+        if job.get('instagram_status','pending')!='pending':
+            raise RuntimeError('Estado de Instagram desconocido: '+str(job.get('instagram_status')))
         try:
-            nombre = pendiente[
-                "media_name"
-            ]
-
-            archivo = MEDIA / nombre
-
-            if not archivo.is_file():
+            image_file=MEDIA/job['media_name']
+            if not image_file.is_file():
                 restore_pending_media()
-
-            if not archivo.is_file():
-                raise RuntimeError(
-                    "Imagen pendiente no disponible"
-                )
-
-            if pendiente not in estado["pending"]:
-                raise RuntimeError(
-                    "El caso fue archivado "
-                    "durante la recuperación."
-                )
-
-            url = put_media(
-                nombre,
-                archivo
-            )
-
-            verificar_imagen_publica(
-                url
-            )
-
-            pendiente[
-                "image_url"
-            ] = url
-
-            state_save(
-                estado
-            )
-
+            if not image_file.is_file():
+                raise RuntimeError('Imagen faltante; se requiere recuperar o generar')
+            if job not in state['pending']:
+                raise RuntimeError('Pendiente archivado durante recuperación; no se enviará')
+            url=put_media(job['media_name'],image_file)
+            check_public_image(url)
+            job['image_url']=url
+            state_save(state)
         except Exception as exc:
-            error = (
-                pendiente["ocid"]
-                + ": "
-                + safe_error(exc)
-            )
-
-            log(
-                "ERROR ANTES DEL ENVÍO:",
-                error
-            )
-
-            errores.append(
-                error
-            )
-
+            errores.append(f'{job["ocid"]}: imagen/hosting: {str(exc)[:160]}')
+            print('ERROR ANTES DEL ENVÍO:',errores[-1])
             continue
-
-        # Guardar el riesgo ANTES del POST.
-        # Si GitHub Actions se interrumpe,
-        # no volver a publicar a ciegas.
-        pendiente[
-            "instagram_status"
-        ] = "uncertain"
-
-        pendiente[
-            "started_at"
-        ] = datetime.now(
-            TZ
-        ).isoformat()
-
-        state_save(
-            estado
-        )
-
+        # Se graba el estado antes del primer POST para evitar duplicados si
+        # GitHub Actions muere tras la publicación pero antes de guardar su ID.
+        job['instagram_status']='uncertain'
+        job['started_at']=datetime.now(ZoneInfo('America/Santiago')).isoformat()
+        state_save(state)
         try:
-            post_id = instagram_publish(
-                url,
-                pendiente["caption"],
-                user,
-                token
-            )
-
-            pendiente.setdefault(
-                "published",
-                {}
-            )["instagram"] = post_id
-
-            pendiente[
-                "instagram_status"
-            ] = "published"
-
-            state_save(
-                estado
-            )
-
-            if uid not in estado["history"]:
-                estado["history"].append(
-                    uid
-                )
-
-            pendientes.remove(
-                pendiente
-            )
-
-            state_save(
-                estado
-            )
-
-            log(
-                "INSTAGRAM PUBLICADO:",
-                post_id,
-                "| Caso:",
-                pendiente["ocid"]
-            )
-
+            post_id=instagram_publish(url,job['caption'],user,token)
+            job.setdefault('published',{})['instagram']=post_id
+            job['instagram_status']='published'
+            state_save(state)
+            if uid not in state['history']:state['history'].append(uid)
+            state['pending'].remove(job)
+            state_save(state)
+            print('INSTAGRAM PUBLICADO:',post_id,'| Caso:',job['ocid'])
         except Exception as exc:
-            mensaje = safe_error(
-                exc
-            )
-
-            pendiente[
-                "instagram_error"
-            ] = mensaje
-
-            try:
-                state_save(
-                    estado
-                )
-
-            except Exception as state_exc:
-                log(
-                    "ERROR GUARDANDO HISTORIAL:",
-                    safe_error(state_exc)
-                )
-
-            errores.append(
-                pendiente["ocid"]
-                + ": "
-                + mensaje
-            )
-
-            log(
-                "ENVÍO INCIERTO:",
-                pendiente["ocid"],
-                "No se reintentará automáticamente."
-            )
-
+            job['instagram_error']=str(exc)[:250]
+            try:state_save(state)
+            except Exception as err:print('ERROR GUARDANDO ESTADO:',type(err).__name__)
+            errores.append(f'{job["ocid"]}: {str(exc)[:160]}')
+            print('PUBLICACIÓN INCIERTA; NO REINTENTAR A CIEGAS:',errores[-1])
     if errores:
-        raise RuntimeError(
-            f"{len(errores)} publicación(es) "
-            "fallaron o requieren revisión "
-            "manual en Instagram y GitHub Issues."
+        raise RuntimeError(f'{len(errores)} envío(s) fallaron o requieren revisión; consulte el historial de GitHub Issues')
+
+def generar():
+    state=init_state()
+    preview = os.getenv('PUBLISH_ENABLED','false').lower() != 'true'
+    if state['pending'] and preview:
+        # Preservar envíos inciertos aunque se active temporalmente modo prueba.
+        uncertain=[j for j in state['pending'] if j.get('instagram_status') in ('uncertain','sending')]
+        for job in uncertain:
+            if not any(x.get('unique_id')==job['unique_id'] for x in state.setdefault('uncertain',[])):
+                state['uncertain'].append(job)
+        print('Modo prueba: liberando solo pendientes sin envío; inciertos archivados.')
+        state['pending'] = []
+        state_save(state)
+    elif state['pending']:
+        recovered=restore_pending_media()
+        safe=[j for j in recovered if j.get('instagram_status','pending')=='pending']
+        if safe:
+            print(f'Hay {len(safe)} caso(s) recuperados para publicación.')
+            return
+        # Ningún pendiente recuperable: buscar otra adjudicación automáticamente.
+        print('Sin imágenes anteriores recuperables. Buscando una adjudicación nueva.')
+    # No dejar que un caso de publicación incierta bloquee nuevas ediciones.
+    # Se conserva íntegro en el historial para reconciliar manualmente.
+    uncertain=[j for j in state['pending'] if j.get('instagram_status') in ('uncertain','sending')]
+    if uncertain:
+        for job in uncertain:
+            if not any(x.get('unique_id')==job['unique_id'] for x in state.setdefault('uncertain',[])):
+                state['uncertain'].append(job)
+        state['pending']=[j for j in state['pending'] if j not in uncertain]
+        state_save(state)
+        print('Envíos inciertos archivados para revisión manual:',len(uncertain))
+    # Descargar JSONL gzip por streaming hasta presupuesto: la descarga se corta en un límite.
+    # Los registros JSON completos recuperados son genuinos; los registros truncados se descartan.
+    def descargar_registros(url, max_mb=MAX_MB_DESCARGA, max_records=MAX_REGISTROS):
+        print('Consultando conjunto abierto OCDS de ChileCompra (sin token):',url)
+        r=requests.get(url,stream=True,timeout=(20,90),headers={'User-Agent':'ChileBajoLaLupaResearch/1.0 (datos abiertos)'})
+        r.raise_for_status()
+        dec=zlib.decompressobj(16+zlib.MAX_WBITS)
+        buffer=b''; bytes_comprimidos=0; records=[]
+        for chunk in r.iter_content(chunk_size=256*1024):
+            if not chunk: continue
+            bytes_comprimidos+=len(chunk)
+            data=dec.decompress(chunk)
+            buffer+=data
+            *lineas,buffer=buffer.split(b'\n')
+            for linea in lineas:
+                if not linea.strip(): continue
+                try:
+                    records.append(json.loads(linea))
+                except (ValueError,UnicodeDecodeError):
+                    continue
+                if len(records)>=max_records: break
+            if bytes_comprimidos >= max_mb*1024*1024 or len(records)>=max_records:
+                break
+        r.close()
+        print(f'Registros OCDS descargados: {len(records)} | Transferencia: {bytes_comprimidos/1024/1024:.1f} MB')
+        if not records:
+            raise RuntimeError('No se pudieron leer registros JSON reales de la fuente abierta.')
+        return records
+
+    registros=None; errores=[]
+    for endpoint in (URL,URL_REPLICA):
+        try:
+            registros=descargar_registros(endpoint)
+            if registros:
+                URL_USADA=endpoint
+                break
+        except Exception as e:
+            errores.append(str(e))
+            print('La fuente no respondió:',str(e)[:170])
+    if not registros:
+        raise RuntimeError('No fue posible consultar datos abiertos reales. No se generan publicaciones ficticias. '+ ' | '.join(errores))
+
+    # Compatibilidad OCDS: compiled releases y paquetes de releases.
+    def iterar_releases(obj):
+        if isinstance(obj,dict):
+            if isinstance(obj.get('compiledRelease'),dict): yield obj['compiledRelease']
+            elif isinstance(obj.get('releases'),list):
+                for v in obj['releases']:
+                    if isinstance(v,dict): yield v
+            elif ('awards' in obj or 'tender' in obj): yield obj
+
+
+    def num(v):
+        if isinstance(v,(float,int)) and math.isfinite(v): return float(v)
+        if isinstance(v,str):
+            try:
+                s=v.strip().replace(' ','')
+                if ',' in s and '.' in s: s=s.replace('.','').replace(',','.')
+                elif ',' in s:s=s.replace(',','.')
+                return float(s)
+            except ValueError: pass
+        return None
+
+
+    def normalizar(txt):
+        import unicodedata
+        txt=unicodedata.normalize('NFKD',str(txt).lower())
+        txt=''.join(c for c in txt if not unicodedata.combining(c))
+        return re.sub(r'\s+',' ',re.sub('[^a-z0-9 ]',' ',txt)).strip()
+
+
+    def fmt(x): return '$'+format(round(x),',').replace(',','.')
+
+    items=[]
+    for rec in registros:
+        for release in iterar_releases(rec):
+            comprador=(release.get('buyer') or {}).get('name') or 'Organismo no indicado'
+            ocid=release.get('ocid') or rec.get('ocid') or release.get('id') or ''
+            fecha_registro=release.get('date') or ''
+            for award in (release.get('awards') or []):
+                if not isinstance(award,dict): continue
+                # Usar solamente adjudicaciones; no confundir con compras efectivamente pagadas.
+                if str(award.get('status','')).lower() in ('cancelled','canceled','unsuccessful'): continue
+                suppliers=award.get('suppliers') or []
+                proveedor=(suppliers[0].get('name') if suppliers and isinstance(suppliers[0],dict) else '') or 'No indicado'
+                for it in (award.get('items') or []):
+                    if not isinstance(it,dict): continue
+                    desc=it.get('description') or ((it.get('classification') or {}).get('description')) or ''
+                    cant=num(it.get('quantity'))
+                    unidad=(it.get('unit') or {})
+                    if not isinstance(unidad,dict): unidad={}
+                    precio=(unidad.get('value') or {})
+                    if not isinstance(precio,dict): precio={}
+                    unit_amount=num(precio.get('amount'))
+                    currency=precio.get('currency') or (award.get('value') or {}).get('currency')
+                    unitname=unidad.get('name') or unidad.get('id') or ''
+                    if not desc or not unit_amount or unit_amount<=0 or currency!='CLP': continue
+                    if cant is not None and cant<=0: continue
+                    key=normalizar(desc)
+                    # Excluir descripciones demasiado genéricas: comparables deben tener identidad legible.
+                    if len(key)<12 or len(key.split())<2: continue
+                    items.append({'ocid':ocid,'award_id':award.get('id',''),'fecha_adjudicacion':award.get('date') or '', 'fecha_registro':fecha_registro,
+                        'comprador':comprador,'proveedor':proveedor,'descripcion':desc,
+                        'clave':key,'precio_unitario':unit_amount,'cantidad':cant,'unidad':normalizar(unitname),
+                        'moneda':'CLP','fuente':URL_USADA})
+
+    if not items:
+        raise RuntimeError('El bloque descargado no contiene adjudicaciones con ítems y precio unitario CLP verificable. No se generará contenido engañoso.')
+
+    # Selección: coincidencia EXACTA de descripción normalizada + unidad.
+    # No implica igualdad de marca/modelo; por eso siempre se presenta como referencia orientativa.
+    grupo=defaultdict(list)
+    for it in items:
+        grupo[(it['clave'],it['unidad'])].append(it)
+
+    comparables=[]
+    for key, rows in grupo.items():
+        vals=list({r['ocid']: r for r in rows if r['ocid']}.values())
+        if len(vals)<3: continue
+        for candidato in vals:
+            if not candidato.get('fecha_adjudicacion'): continue
+            base=[r['precio_unitario'] for r in vals if r['ocid']!=candidato['ocid']]
+            if len(base)<2 or min(base)<=0 or max(base)/min(base)>4: continue
+            ref_c=statistics.median(base)
+            dif_c=(candidato['precio_unitario']/ref_c-1)*100
+            comparables.append({'caso':candidato,'ref':ref_c,'dif':dif_c,'nref':len(base),'comparacion':True})
+
+    # También considerar adjudicaciones reales sin comparables, indicando que no hay porcentaje.
+    # Se deduplica por proceso; se exige descripción, precio unitario CLP y fuente real.
+    sin_comparacion=[]
+    for it in items:
+        if it.get('ocid'):
+            sin_comparacion.append({'caso':it,'ref':None,'dif':None,'nref':None,'comparacion':False})
+
+    # No volver a seleccionar siempre el valor máximo o el mayor porcentaje.
+    # La aleatoriedad del sistema hace variar el orden entre ejecuciones, sin añadir datos falsos.
+    random.SystemRandom().shuffle(comparables)
+    random.SystemRandom().shuffle(sin_comparacion)
+
+    historial=(set(state['history']) | {p['unique_id'] for p in state['pending']} |
+               {p['unique_id'] for p in state.get('abandoned', [])} |
+               {p['unique_id'] for p in state.get('uncertain', [])})
+
+    vistos=set()
+    candidatos=[]
+    for entry in comparables:
+        it=entry['caso']
+        unique_id=f"{it['ocid']}::{it.get('award_id','')}::{it['clave']}"
+        if unique_id in vistos:continue
+        vistos.add(unique_id)
+        if unique_id in historial:continue
+        entry['unique_id']=unique_id
+        candidatos.append(entry)
+
+    if not candidatos:
+        raise RuntimeError('Ya se utilizaron todos los candidatos del bloque descargado. '
+            'Aumenta MAX_MB_DESCARGA / MAX_REGISTROS o usa otro ANIO para ampliar la muestra. '
+            'No se borró el historial ni se repitieron casos.')
+
+    seleccionados=[]
+    procesos_elegidos=set()
+    for entry in candidatos:
+        expediente=entry['caso']['ocid']
+        if expediente in procesos_elegidos:continue
+        seleccionados.append(entry)
+        procesos_elegidos.add(expediente)
+        if len(seleccionados)>=CASOS_POR_EJECUCION:break
+
+    print(f'Casos nuevos seleccionados: {len(seleccionados)} | Ya usados previamente: {len(historial)}')
+
+    def generar_publicacion(entry, indice):
+        caso=entry["caso"]
+        ref=entry["ref"]
+        dif=entry["dif"]
+        nref=entry["nref"]
+        comparacion=entry["comparacion"]
+        destino=CARPETA / f"caso_{indice:02d}_{hashlib.sha256(entry['unique_id'].encode()).hexdigest()[:10]}"
+        destino.mkdir(parents=True, exist_ok=True)
+        # Metadatos del procedimiento: se usa SOLO la fecha award.date para afirmar adjudicación.
+        # 'release.date' refleja la fecha del registro/publicación OCDS, no necesariamente la adjudicación.
+        def fecha_legible(value):
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value).replace('Z', '+00:00')).strftime('%d-%m-%Y')
+            except (ValueError, TypeError):
+                return None
+
+        fecha_adj=fecha_legible(caso.get('fecha_adjudicacion'))
+        fecha_reg=fecha_legible(caso.get('fecha_registro'))
+        fecha_hoy=datetime.now(ZoneInfo('America/Santiago')).strftime('%d-%m-%Y')
+        fuente_detalle='https://data.open-contracting.org/es/publication/144'
+
+        # "Incumbentes" = proveedores observados en adjudicaciones ANTERIORES del
+        # mismo artículo normalizado en la MUESTRA disponible, no del universo completo.
+        proveedores_anteriores=[]
+        if fecha_adj and caso.get('fecha_adjudicacion'):
+            try:
+                momento=datetime.fromisoformat(str(caso['fecha_adjudicacion']).replace('Z','+00:00'))
+                for r in items:
+                    if r['ocid']==caso['ocid'] or r['clave']!=caso['clave'] or r['unidad']!=caso['unidad']:
+                        continue
+                    if not r.get('fecha_adjudicacion') or not r.get('proveedor'):
+                        continue
+                    try:
+                        anterior=datetime.fromisoformat(str(r['fecha_adjudicacion']).replace('Z','+00:00'))
+                        if anterior.tzinfo is None and momento.tzinfo is not None:
+                            anterior=anterior.replace(tzinfo=momento.tzinfo)
+                        if momento.tzinfo is None and anterior.tzinfo is not None:
+                            momento=momento.replace(tzinfo=anterior.tzinfo)
+                    except (ValueError,TypeError):
+                        continue
+                    if anterior < momento:
+                        proveedores_anteriores.append((r['proveedor'],r['ocid'],fecha_legible(r['fecha_adjudicacion'])))
+            except (ValueError,TypeError):
+                pass
+        proveedores_anteriores=list({(p,ocid,fecha) for p,ocid,fecha in proveedores_anteriores})
+        proveedores_anteriores.sort(key=lambda r:(r[0],r[1]))
+        incumbentes=sorted({p for p,_,_ in proveedores_anteriores})
+
+        proveedor_prev_mismo_comprador=[]
+        if fecha_adj and caso.get('fecha_adjudicacion'):
+            for r in items:
+                if r['ocid']==caso['ocid'] or r['clave']!=caso['clave'] or r['unidad']!=caso['unidad']:
+                    continue
+                if r['comprador']!=caso['comprador'] or not r.get('fecha_adjudicacion'):
+                    continue
+                try:
+                    if str(r['fecha_adjudicacion'])[:10] < str(caso['fecha_adjudicacion'])[:10]:
+                        proveedor_prev_mismo_comprador.append(r['proveedor'])
+                except Exception:
+                    pass
+        proveedor_prev_mismo_comprador=sorted(set(proveedor_prev_mismo_comprador))
+
+        precio=fmt(caso['precio_unitario'])
+        fecha_nota = (f'La adjudicación está fechada el {fecha_adj}. ' if fecha_adj else
+                      (f'La fecha de adjudicación no consta con claridad en el registro; la fecha visible del registro es {fecha_reg}. ' if fecha_reg else
+                       'La fecha de adjudicación no consta con claridad en el registro. '))
+
+        if comparacion:
+            comparacion_txt=(f'Para poner la cifra en contexto, contrastamos el precio unitario de {precio} '
+                             f'con otras {nref} adjudicaciones del archivo descargado que presentan una descripción '
+                             f'normalizada y unidad de medida idénticas. La mediana de esas referencias fue {fmt(ref)}, '
+                             f'por lo que el precio reportado resulta {abs(dif):.1f}% '
+                             f'{"superior" if dif>0 else "inferior" if dif<0 else "igual"} a ese parámetro. ')
+        else:
+            comparacion_txt=('En el segmento descargado no encontramos suficientes adjudicaciones comparables con descripción '
+                             'normalizada y unidad de medida idénticas como para construir una referencia estadística sólida. ')
+
+        if incumbentes:
+            if len(incumbentes)==1:
+                inc_txt=f'Entre los antecedentes previos observados para el mismo artículo aparece como proveedor anterior {incumbentes[0]}. '
+            else:
+                lista=', '.join(incumbentes[:3])
+                inc_txt=(f'Entre los antecedentes previos observados para el mismo artículo aparecen como proveedores anteriores {lista}'
+                         + (' y otros. ' if len(incumbentes)>3 else '. '))
+        else:
+            inc_txt='En la muestra descargada no identificamos proveedores anteriores verificables para el mismo artículo. '
+
+        if proveedor_prev_mismo_comprador:
+            mismos=', '.join(proveedor_prev_mismo_comprador[:3])
+            comprador_hist=(f'Además, para el mismo organismo comprador figuran antecedentes previos de este artículo adjudicados a {mismos}'
+                            + (' y otros proveedores. ' if len(proveedor_prev_mismo_comprador)>3 else '. '))
+        else:
+            comprador_hist=''
+
+        # Instagram conserva los saltos de línea del campo caption.
+        # Separar cada bloque con una línea vacía (\n\n).
+        # Cuando la diferencia es cero se dice «igual», sin «0.0% igual».
+        if comparacion:
+            comparacion_txt=(
+                f'Para poner la cifra en contexto, contrastamos el precio unitario de {precio} '
+                f'con otras {nref} adjudicaciones del archivo descargado que presentan una '
+                'descripción normalizada y unidad de medida idénticas. '
+                f'La mediana de esas referencias fue {fmt(ref)}, por lo que el precio '
+                'reportado resulta '
+                + (f'{abs(dif):.1f}% superior' if dif>0 else
+                   f'{abs(dif):.1f}% inferior' if dif<0 else 'igual')
+                + ' a ese parámetro.'
+            )
+        else:
+            comparacion_txt=(
+                'En el segmento descargado no encontramos suficientes adjudicaciones '
+                'comparables con descripción normalizada y unidad de medida idénticas '
+                'como para construir una referencia estadística sólida.'
+            )
+
+        if incumbentes:
+            nombres=', '.join(incumbentes[:2])
+            comparacion_txt+=' Entre los antecedentes previos observados para el '
+            comparacion_txt+='mismo artículo aparecen proveedores como '+nombres+'.'
+
+        titulo='=== CUANTO PAGA CHILE? === 🔎'
+        pregunta='¿Qué muestran los registros de esta adjudicación pública?'
+        antecedentes=(
+            'En los datos abiertos de compras públicas de Chile a partir de información '
+            f'de ChileCompra, encontramos el proceso {caso["ocid"]}, en el que figura '
+            f'{caso["comprador"]} como organismo comprador y {caso["proveedor"]} '
+            'como proveedor adjudicado.'
         )
+        articulo=(
+            f'El artículo descrito como «{caso["descripcion"]}» registra un precio '
+            f'unitario de {precio} pesos chilenos.'
+        )
+        if fecha_adj:
+            articulo+=f' La adjudicación está fechada el {fecha_adj}.'
+        elif fecha_reg:
+            articulo+=' La fecha de adjudicación no consta; fecha del registro: '+fecha_reg+'.'
+
+        nota=('NOTA: Las cifras corresponden a adjudicaciones, no necesariamente '
+              'a pagos realizados.\nFuente: ChileCompra vía OCP.')
+        hashtags='#ComprasPúblicas #ChileCompra #DatosAbiertos #Transparencia #Chile'
+        texto='\n\n'.join((titulo,pregunta,antecedentes,articulo,
+                             comparacion_txt,nota,hashtags))
+
+        # Mantener el límite de Instagram sin desfigurar cifras ni nombres.
+        if len(texto)>2200:
+            raise RuntimeError(f'El pie supera los 2200 caracteres ({len(texto)}). '
+                               'Se descarta el caso para evitar un texto truncado.')
+
+        (destino/'pie_publicacion.txt').write_text(texto,encoding='utf8')
+        (destino/'respaldo.json').write_text(json.dumps({
+            'fuente':URL_USADA,'fecha_consulta':fecha_hoy,
+            'seleccion':caso,'fecha_adjudicacion_verificada':fecha_adj,
+            'fecha_registro':fecha_reg,'comparacion_adjudicaciones':comparacion,
+            'mediana_referencia':ref,'n_referencias':nref,'diferencia_pct':dif,
+            'incumbentes_observados_en_muestra':incumbentes,
+            'adjudicaciones_previas_observadas':[
+                {'proveedor':p,'ocid':ocid,'fecha':f} for p,ocid,f in proveedores_anteriores
+            ],
+            'anteriores_mismo_comprador':proveedor_prev_mismo_comprador,
+            'total_items_validos_en_muestra':len(items),
+            'observacion':'Datos parciales del archivo anual OCDS; el referente es de adjudicaciones públicas, no de comercios.'
+        },ensure_ascii=False,indent=2),encoding='utf8')
+
+        W,H=1080,1350
+        im=Image.new('RGB',(W,H),'#0a1223')
+        d=ImageDraw.Draw(im)
+        from functools import lru_cache
+        from pathlib import Path
+
+        @lru_cache(maxsize=32)
+        def font(size,bold=False):
+            names=['DejaVuSans-Bold.ttf','LiberationSans-Bold.ttf'] if bold else ['DejaVuSans.ttf','LiberationSans-Regular.ttf']
+            roots=['/usr/share/fonts/truetype/dejavu','/usr/share/fonts/truetype/liberation2',
+                   '/usr/share/fonts/truetype/liberation','/usr/local/lib/python3.13/site-packages/matplotlib/mpl-data/fonts/ttf',
+                   '/usr/local/lib/python3.12/site-packages/matplotlib/mpl-data/fonts/ttf']
+            for root in roots:
+                for name in names:
+                    path=Path(root)/name
+                    if path.is_file():
+                        try:return ImageFont.truetype(str(path),size)
+                        except OSError:pass
+            try:return ImageFont.load_default(size=size)
+            except TypeError:return ImageFont.load_default()
+
+        def lines_fit(txt,width,f):
+            result=[];cur=''
+            for word in str(txt).split():
+                cand=f'{cur} {word}'.strip()
+                if d.textbbox((0,0),cand,font=f)[2]<=width:
+                    cur=cand
+                else:
+                    if cur:
+                        result.append(cur)
+                    cur=word
+            if cur:
+                result.append(cur)
+            return result
+
+        def block(txt,x,y,width,size,color,weight=False,max_lines=3,gap=9,align='left'):
+            f=font(size,weight)
+            lines=lines_fit(txt,width,f)
+            if len(lines)>max_lines:
+                lines=lines[:max_lines]
+                while lines[-1] and d.textbbox((0,0),lines[-1]+'…',font=f)[2]>width:
+                    lines[-1]=lines[-1][:-1]
+                lines[-1]=lines[-1].rstrip()+'…'
+            for s in lines:
+                bbox=d.textbbox((0,0),s,font=f)
+                tw=bbox[2]-bbox[0]
+                xx=x if align=='left' else x+(width-tw)//2
+                d.text((xx,y),s,font=f,fill=color)
+                y+=size+gap
+            return y
+
+        def centered_text(y,text,size,color,bold=True,max_width=960):
+            f=font(size,bold)
+            while size>16:
+                bbox=d.textbbox((0,0),text,font=f)
+                tw=bbox[2]-bbox[0]
+                if tw<=max_width:
+                    break
+                size-=2
+                f=font(size,bold)
+            bbox=d.textbbox((0,0),text,font=f)
+            tw=bbox[2]-bbox[0]
+            x=(W-tw)//2
+            d.text((x,y),text,font=f,fill=color)
+            return y + (bbox[3]-bbox[1])
+
+        # Panel superior con cifras alineadas al centro
+        d.rounded_rectangle((35,35,1045,670),radius=38,fill='#15243f')
+        y=78
+        y=block('PRECIO UNITARIO ADJUDICADO',60,y,960,28,'#c8d7f0',weight=True,max_lines=1,align='center')
+        y+=18
+        y=centered_text(y,precio,106,'#ffdf62',True,900)
+        y+=52
+
+        if comparacion:
+            y=block('DIFERENCIA VS OTRAS ADJUDICACIONES',60,y,960,26,'#c8d7f0',weight=True,max_lines=1,align='center')
+            y+=18
+            diff_color = '#ff5c5c' if dif>0 else '#30d07d' if dif<0 else '#ffd84d'
+            y=centered_text(y,f'{dif:+.1f}%' if dif!=0 else '0.0%',126,diff_color,True,900)
+            y+=26
+            y=block(f'Mediana de referencia: {fmt(ref)}',60,y,960,36,'#f4f7fc',weight=True,max_lines=1,align='center')
+        else:
+            y=block('SIN REFERENCIA HOMOGÉNEA',60,y,960,42,'#ffab72',weight=True,max_lines=1,align='center')
+
+        # Sección inferior con el resto de los textos
+        d.text((68,718),'DETALLES DE LA ADJUDICACIÓN',font=font(30,True),fill='#f1f5fb')
+        d.line((68,766,1012,766),fill='#364760',width=2)
+        y=792
+        entries=[
+            ('ARTÍCULO',caso['descripcion'],3),
+            ('ORGANISMO',caso['comprador'],2),
+            ('PROVEEDOR ADJUDICADO',caso['proveedor'],2),
+            ('FECHA DE ADJUDICACIÓN',fecha_adj or 'No consta en el registro',1),
+            ('IDENTIFICADOR',str(caso['ocid']),2),
+        ]
+        for key,value,maxlines in entries:
+            if y>1190:
+                break
+            d.text((70,y),key,font=font(21,True),fill='#75baff')
+            y+=30
+            y=block(str(value),70,y,940,27,'#f1f5fb',max_lines=maxlines,gap=6)
+            y+=15
+
+        # Pie mínimo sin los textos eliminados por el usuario.
+        d.rectangle((0,1260,1080,1350),fill='#07101e')
+        footer1='Fuente: ChileCompra vía OCP'
+        d.text((65,1296),footer1,font=font(21,True),fill='#ffd28a')
+
+        img_path=destino/'imagen_instagram_facebook.png'
+        im.save(img_path)
+
+        print('\n=== PIE DE PUBLICACIÓN ===\n'+texto)
+        print('Archivos del caso:',destino)
+        return img_path
 
 
-# ==========================================
-# EJECUCION
-# ==========================================
+    nuevos=[]
+    for i,entry in enumerate(seleccionados,1):
+        uid=entry['unique_id']
+        imagen=generar_publicacion(entry,i)
+        name=hashlib.sha256(uid.encode('utf8')).hexdigest()[:24]+'.jpg'
+        # Imagen pública exclusivamente para que Instagram pueda recuperarla.
+        with Image.open(imagen) as img:
+            img.convert('RGB').save(MEDIA/name,'JPEG',quality=92,optimize=True)
+        caption=(imagen.parent/'pie_publicacion.txt').read_text(encoding='utf8')
+        # Límite de caption Instagram para foto individual.
+        if len(caption)>2200:
+            raise RuntimeError(f'Pie de {entry["caso"]["ocid"]} supera los 2200 caracteres de Instagram. Reducir texto sin perder verificación.')
+        nuevos.append({'unique_id':uid,'ocid':entry['caso']['ocid'],'media_name':name,
+             'caption':caption,'instagram_status':'pending','published':{'instagram':None}})
+    if not nuevos:
+        raise RuntimeError('No se encontraron casos nuevos con comparación verificable. No se publicará nada.')
+    state['pending']=nuevos
+    state_save(state)
+    print(f'{len(nuevos)} casos preparados para Instagram. Imágenes temporales: {MEDIA}.')
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Cuánto Paga Chile - "
-            "Datos abiertos e Instagram"
-        )
-    )
+    p=argparse.ArgumentParser(description='Cuanto Paga Chile: generacion y publicacion')
+    p.add_argument('command',choices=['generate','publish','check-instagram'])
+    args=p.parse_args()
+    if args.command=='generate': generar()
+    elif args.command=='check-instagram': instagram_check()
+    else: publicar()
 
-    parser.add_argument(
-        "command",
-        choices=[
-            "check-instagram",
-            "generate",
-            "publish",
-        ],
-    )
-
-    args = parser.parse_args()
-
-    if args.command == "check-instagram":
-        instagram_check()
-
-    elif args.command == "generate":
-        generar()
-
-    elif args.command == "publish":
-        publicar()
-
-
-if __name__ == "__main__":
-    try:
-        main()
-
-    except Exception as exc:
-        log(
-            "ERROR:",
-            safe_error(exc)
-        )
-
-        raise SystemExit(1)
+if __name__=='__main__': main()
