@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cuanto Paga Chile: verifica cada día y renueva un token Instagram Login cada 7 días.
+"""Cuanto Gana Chile: verifica cada día y renueva un token Instagram Login cada 7 días.
 
 Solo sirve para Instagram Login (graph.instagram.com). No recupera tokens
 revocados ni puede asegurar que Meta no invalide una sesión posteriormente.
@@ -19,7 +19,7 @@ import requests
 from nacl import encoding, public
 
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'CuantoPagaChile-IG-Lifecycle/3.1'})
+SESSION.headers.update({'User-Agent': 'CuantoGanaChile-IG-Lifecycle/3.1'})
 TIMEOUT = (8, 22)
 GH = 'https://api.github.com'
 IG = 'https://graph.instagram.com'
@@ -79,7 +79,7 @@ def verify_ig(token, expected_username, expected_id):
                            f'Instagram devolvió @{username or "ausente"}. No se modifica el secreto.')
     ids = {str(data[k]) for k in ('id', 'user_id') if data.get(k) is not None}
     if expected_id not in ids:
-        raise RuntimeError('INSTAGRAM_USER_ID no coincide con id ni user_id de Instagram; '
+        raise RuntimeError('IG_USER_ID no coincide con id ni user_id de Instagram; '
                            'no se modifica el secreto.')
     return 'user_id' if str(data.get('user_id')) == expected_id else 'id'
 
@@ -118,7 +118,7 @@ def save_secret(repo, admin, token):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Cuanto Paga Chile Instagram token lifecycle')
+    parser = argparse.ArgumentParser(description='Cuanto Gana Chile Instagram token lifecycle')
     parser.add_argument('--force-refresh', action='store_true',
                         help='Ignora período de 7 días, sin saltar validaciones ni reglas de Meta')
     parser.add_argument('--check-only', action='store_true', help='Solo verificar token')
@@ -126,14 +126,18 @@ def main():
     if os.getenv('IG_LOGIN_TYPE', 'instagram').lower() != 'instagram':
         raise RuntimeError('Este script requiere IG_LOGIN_TYPE=instagram')
     username = need('IG_EXPECTED_USERNAME').lstrip('@').lower()
-    if username != 'cuanto_paga_chile':
-        raise RuntimeError('Protección: este renovador solo opera para @cuanto_paga_chile')
+    if username != 'cuanto_gana_chile':
+        raise RuntimeError('Protección: este renovador solo opera para @cuanto_gana_chile')
     repo = need('GITHUB_REPOSITORY')
     if not re.fullmatch(r'[A-Za-z\d_.-]+/[A-Za-z\d_.-]+', repo):
         raise RuntimeError('GITHUB_REPOSITORY no válido')
     token = need(SECRET_NAME)
-    user_id = need('INSTAGRAM_USER_ID')
+    user_id = need('IG_USER_ID')
+    publish_enabled = os.getenv('PUBLISH_ENABLED', '').strip().lower()
+    if publish_enabled and publish_enabled not in ('true', 'false', '1', '0', 'yes', 'no'):
+        raise RuntimeError('PUBLISH_ENABLED debe ser true o false (o 1/0, yes/no)')
     log('Instagram: comprobando token e identidad de @' + username)
+    log('Publicacion habilitada: ' + (publish_enabled or 'no configurado') + '; el refresh es independiente')
     try:
         matched = verify_ig(token, username, user_id)
     except ApiError as exc:
@@ -144,7 +148,7 @@ def main():
         raise
     log(f'Instagram: token válido, identidad correcta (coincide con {matched})')
     if opts.check_only and opts.force_refresh:
-        raise RuntimeError('--check-only y --force-refresh no pueden combinarse')
+        log('AVISO: --check-only tiene prioridad sobre --force-refresh; no se modificaran secretos.')
     if opts.check_only:
         summary('✅ Instagram: token vigente; comprobación sin renovación.')
         return
@@ -194,7 +198,7 @@ def main():
     if not after.get('updated_at') or after.get('updated_at') == before.get('updated_at'):
         raise RuntimeError('GitHub no confirmó un cambio de metadatos tras la actualización')
     log('Instagram: renovación aceptada y escritura de GitHub Secrets completada')
-    summary(f'✅ @cuanto_paga_chile: token renovado, validado y escrito en GitHub. '
+    summary(f'✅ @cuanto_gana_chile: token renovado, validado y escrito en GitHub. '
             f'Vigencia informada por Meta: {int(expires // 86400)} días. '
             'La lectura posterior de GitHub no permite verificar el valor del secreto.')
 
@@ -204,5 +208,5 @@ if __name__ == '__main__':
         main()
     except (RuntimeError, KeyError, ValueError) as exc:
         log('ERROR: ' + str(exc))
-        summary('❌ Cuanto Paga Chile: revisar el monitor del token y autorización de Meta.')
+        summary('❌ Cuanto Gana Chile: revisar el monitor del token y autorización de Meta.')
         sys.exit(1)
