@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cuanto Gana Chile: verifica cada día y renueva un token Instagram Login cada 7 días.
+"""Cuanto Paga Chile: verifica cada día y renueva un token Instagram Login cada 7 días.
 
 Solo sirve para Instagram Login (graph.instagram.com). No recupera tokens
 revocados ni puede asegurar que Meta no invalide una sesión posteriormente.
@@ -19,7 +19,7 @@ import requests
 from nacl import encoding, public
 
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'CuantoGanaChile-IG-Lifecycle/3.1'})
+SESSION.headers.update({'User-Agent': 'CuantoPagaChile-IG-Lifecycle/3.1'})
 TIMEOUT = (8, 22)
 GH = 'https://api.github.com'
 IG = 'https://graph.instagram.com'
@@ -118,7 +118,7 @@ def save_secret(repo, admin, token):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Cuanto Gana Chile Instagram token lifecycle')
+    parser = argparse.ArgumentParser(description='Cuanto Paga Chile Instagram token lifecycle')
     parser.add_argument('--force-refresh', action='store_true',
                         help='Ignora período de 7 días, sin saltar validaciones ni reglas de Meta')
     parser.add_argument('--check-only', action='store_true', help='Solo verificar token')
@@ -126,11 +126,13 @@ def main():
     if os.getenv('IG_LOGIN_TYPE', 'instagram').lower() != 'instagram':
         raise RuntimeError('Este script requiere IG_LOGIN_TYPE=instagram')
     username = need('IG_EXPECTED_USERNAME').lstrip('@').lower()
-    if username != 'cuanto_gana_chile':
-        raise RuntimeError('Protección: este renovador solo opera para @cuanto_gana_chile')
+    if username != 'cuantopagachile':
+        raise RuntimeError('Protección: este renovador solo opera para @cuantopagachile')
     repo = need('GITHUB_REPOSITORY')
     if not re.fullmatch(r'[A-Za-z\d_.-]+/[A-Za-z\d_.-]+', repo):
         raise RuntimeError('GITHUB_REPOSITORY no válido')
+    if repo.lower() != 'acesped/chilecompra':
+        raise RuntimeError('Protección: este renovador opera exclusivamente en acesped/chilecompra')
     token = need(SECRET_NAME)
     user_id = need('IG_USER_ID')
     publish_enabled = os.getenv('PUBLISH_ENABLED', '').strip().lower()
@@ -198,7 +200,7 @@ def main():
     if not after.get('updated_at') or after.get('updated_at') == before.get('updated_at'):
         raise RuntimeError('GitHub no confirmó un cambio de metadatos tras la actualización')
     log('Instagram: renovación aceptada y escritura de GitHub Secrets completada')
-    summary(f'✅ @cuanto_gana_chile: token renovado, validado y escrito en GitHub. '
+    summary(f'✅ @cuantopagachile: token renovado, validado y escrito en GitHub. '
             f'Vigencia informada por Meta: {int(expires // 86400)} días. '
             'La lectura posterior de GitHub no permite verificar el valor del secreto.')
 
@@ -208,5 +210,5 @@ if __name__ == '__main__':
         main()
     except (RuntimeError, KeyError, ValueError) as exc:
         log('ERROR: ' + str(exc))
-        summary('❌ Cuanto Gana Chile: revisar el monitor del token y autorización de Meta.')
+        summary('❌ Cuanto Paga Chile: revisar el monitor del token y autorización de Meta.')
         sys.exit(1)
