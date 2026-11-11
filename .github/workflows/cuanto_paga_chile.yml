@@ -5,13 +5,16 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Ejecucion diaria a las 13:20 UTC
-    # Chile verano: 10:20
-    # Chile invierno: 09:20
-    - cron: "20 13 * * *"
+    # Todos los dias a las 07:00 hora de Chile
+    - cron: "0 7 * * *"
+      timezone: "America/Santiago"
+
+    # Todos los dias a las 18:00 hora de Chile
+    - cron: "0 18 * * *"
+      timezone: "America/Santiago"
 
 # ==========================================
-# PERMISOS DE GITHUB
+# PERMISOS
 # ==========================================
 
 permissions:
@@ -19,8 +22,6 @@ permissions:
   issues: write
 
 # Evitar ejecuciones simultaneas
-# que puedan publicar casos duplicados.
-
 concurrency:
   group: cuanto-paga-chile-instagram
   cancel-in-progress: false
@@ -34,120 +35,64 @@ jobs:
     name: Analizar adjudicaciones y publicar en Instagram
 
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
 
     env:
-
-      # ====================================
       # GITHUB
-      # ====================================
-
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ====================================
-      # CHILECOMPRA / OCDS
-      # ====================================
-
+      # DATOS CHILECOMPRA
       ANIO: "2026"
-
       CASOS_POR_EJECUCION: "1"
-
       MAX_MB_DESCARGA: "45"
-
       MAX_REGISTROS: "15000"
 
-      # ====================================
       # PUBLICACION AUTOMATICA
-      # ====================================
-
-      # Activada: publica realmente en Instagram.
       PUBLISH_ENABLED: "true"
 
-      # ====================================
       # ALOJAMIENTO DE IMAGENES
-      # ====================================
-
-      # Rama independiente para imagenes.
-      # Se crea automaticamente si no existe.
       IG_MEDIA_BRANCH: "instagram-media"
 
-      # No se necesita GitHub Pages.
-
-      # ====================================
       # INSTAGRAM API
-      # ====================================
-
       IG_GRAPH_BASE: "https://graph.instagram.com"
-
       META_GRAPH_VERSION: "v25.0"
 
-      # Cuenta autorizada para publicar.
       IG_EXPECTED_USERNAME: "cuantopagachile"
 
-      # ID profesional de Instagram.
       IG_USER_ID: ${{ secrets.IG_USER_ID }}
-
-      # Token de Instagram Login.
       INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-
-    # ======================================
-    # PASOS DEL WORKFLOW
-    # ======================================
 
     steps:
 
-      # ------------------------------------
-      # 1. DESCARGAR REPOSITORIO
-      # ------------------------------------
-
+      # 1. Descargar repositorio
       - name: Descargar proyecto
         uses: actions/checkout@v4
 
-      # ------------------------------------
-      # 2. CONFIGURAR PYTHON
-      # ------------------------------------
-
+      # 2. Configurar Python
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # ------------------------------------
-      # 3. INSTALAR DEPENDENCIAS
-      # ------------------------------------
-
+      # 3. Instalar dependencias
       - name: Instalar dependencias Python
         run: |
           python -m pip install --disable-pip-version-check \
             "requests>=2.32,<3" \
             "Pillow>=10,<13"
 
-      # ------------------------------------
-      # 4. VALIDAR EL SCRIPT
-      # ------------------------------------
-
+      # 4. Verificar script Python
       - name: Comprobar archivo Python
         run: |
-          if [ ! -f cuanto_paga_chile.py ]; then
-            echo "::error::No existe cuanto_paga_chile.py"
-            exit 1
-          fi
-
+          test -f cuanto_paga_chile.py
           python -m py_compile cuanto_paga_chile.py
+          echo "Script validado correctamente"
 
-          echo "Script Python validado correctamente"
-
-      # ------------------------------------
-      # 5. VALIDAR CONFIGURACION
-      # ------------------------------------
-
+      # 5. Comprobar configuracion
       - name: Comprobar configuracion de Instagram
         run: |
-          echo "Verificando configuracion de Instagram..."
-
           if [ -z "$IG_USER_ID" ]; then
-            echo "::error::Falta el secreto IG_USER_ID"
+            echo "::error::Falta IG_USER_ID"
             exit 1
           fi
 
@@ -161,51 +106,29 @@ jobs:
             exit 1
           fi
 
-          if [ "$PUBLISH_ENABLED" != "true" ]; then
-            echo "::error::La publicacion no esta habilitada"
-            exit 1
-          fi
+          echo "Configuracion presente"
+          echo "Cuenta: @$IG_EXPECTED_USERNAME"
 
-          echo "Secretos presentes"
-          echo "Cuenta esperada: @$IG_EXPECTED_USERNAME"
-          echo "Publicacion automatica: ACTIVADA"
-
-      # ------------------------------------
-      # 6. VERIFICAR AUTENTICACION CON META
-      # ------------------------------------
-
+      # 6. Validar token de Instagram
       - name: Verificar token e identidad de Instagram
         run: |
           python cuanto_paga_chile.py check-instagram
 
-      # ------------------------------------
-      # 7. VERIFICAR ACCESO A GITHUB
-      # ------------------------------------
-
+      # 7. Verificar acceso a GitHub
       - name: Verificar acceso al repositorio
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Comprobando acceso a GitHub..."
-
           gh api \
             "repos/${GITHUB_REPOSITORY}" \
             --jq '.full_name'
 
-          echo "Repositorio accesible"
-
-      # ------------------------------------
-      # 8. GENERAR PUBLICACION
-      # ------------------------------------
-
+      # 8. Generar publicacion
       - name: Analizar adjudicaciones reales
         run: |
           python cuanto_paga_chile.py generate
 
-      # ------------------------------------
-      # 9. GUARDAR RESPALDO
-      # ------------------------------------
-
+      # 9. Guardar respaldo
       - name: Guardar imagen y respaldo de auditoria
         if: always()
         uses: actions/upload-artifact@v4
@@ -215,52 +138,20 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # ------------------------------------
-      # 10. PUBLICAR EN INSTAGRAM
-      # ------------------------------------
-
+      # 10. Publicar exclusivamente en Instagram
       - name: Publicar imagen en Instagram
         run: |
           python cuanto_paga_chile.py publish
 
-      # ------------------------------------
-      # 11. RESUMEN DE EJECUCION
-      # ------------------------------------
-
+      # 11. Resumen
       - name: Resumen de ejecucion
         if: always()
         run: |
           echo "## Cuánto Paga Chile" >> "$GITHUB_STEP_SUMMARY"
-
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "### Configuracion" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Repositorio: $GITHUB_REPOSITORY" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Cuenta: @$IG_EXPECTED_USERNAME" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Publicacion: $PUBLISH_ENABLED" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Año analizado: $ANIO" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Casos por ejecucion: $CASOS_POR_EJECUCION" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Rama de imagenes: $IG_MEDIA_BRANCH" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "### Ejecucion" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "- Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo "- Cuenta: @$IG_EXPECTED_USERNAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Publicacion: $PUBLISH_ENABLED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Año analizado: $ANIO" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Casos por ejecucion: $CASOS_POR_EJECUCION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Horarios: 07:00 y 18:00 (America/Santiago)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_STEP_SUMMARY"
